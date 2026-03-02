@@ -77,7 +77,13 @@ pub async fn proxymedia_handler(
             }
 
             // Always use interleaving.
-            p.interleave();
+            let interleave: bool = query_params
+                .get("interleave")
+                .map(|s| s == "true")
+                .unwrap_or_default();
+            if interleave {
+                p.interleave();
+            }
         }
 
         let mut headers = axum::http::HeaderMap::new();

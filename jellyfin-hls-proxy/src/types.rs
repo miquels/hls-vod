@@ -28,6 +28,18 @@ where
     }
 }
 
+// Helper to serialize number to string.
+fn number_to_string<S>(number: &Option<i32>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(number) = number {
+        serializer.serialize_str(&format!("{}", number))
+    } else {
+        serializer.serialize_str("0")
+    }
+}
+
 //
 // First, the PlaybackInfoRequest sent to the PlaybackInfo endpoint.
 //
@@ -40,18 +52,23 @@ pub struct PlaybackInfoRequest {
     /// The ID of the user requesting playback
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Starting position in Ticks (1 second = 10,000,000 ticks)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<i64>,
     /// The index of the audio stream to play
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "string_or_number"
+        deserialize_with = "string_or_number",
+        serialize_with = "number_to_string"
     )]
     pub audio_stream_index: Option<i32>,
     /// The index of the subtitle stream to play
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "string_or_number"
+        deserialize_with = "string_or_number",
+        serialize_with = "number_to_string"
     )]
     pub subtitle_stream_index: Option<i32>,
     /// The preferred media source ID
@@ -60,18 +77,24 @@ pub struct PlaybackInfoRequest {
     /// Max bitrate the client can handle
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_streaming_bitrate: Option<i64>,
-    /// Starting position in Ticks (1 second = 10,000,000 ticks)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_time_ticks: Option<i64>,
-    /// The hardware/software capabilities of the client
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_profile: Option<DeviceProfile>,
     /// Whether to enable direct play
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_direct_play: Option<bool>,
     /// Whether to enable transcoding
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_transcoding: Option<bool>,
+    /// Is this playback or just an info request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_playback: Option<bool>,
+    /// Not sure what this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_open_live_stream: Option<bool>,
+    /// Always burn in subtitle when transcoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_burn_in_subtitle_when_transcoding: Option<bool>,
+    /// The hardware/software capabilities of the client
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_profile: Option<DeviceProfile>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -79,12 +102,22 @@ pub struct PlaybackInfoRequest {
 pub struct DeviceProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_streaming_bitrate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_static_bitrate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_streaming_transcoding_bitrate: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub direct_play_profiles: Vec<DirectPlayProfile>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub transcoding_profiles: Vec<TranscodingProfile>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub codec_profiles: Vec<CodecProfile>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub subtitle_profiles: Vec<SubtitleProfile>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub response_profiles: Vec<ResponseProfile>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,7 +133,7 @@ pub struct DirectPlayProfile {
     pub profile_type: String, // e.g., "Video"
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct TranscodingProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,18 +141,69 @@ pub struct TranscodingProfile {
     #[serde(rename = "Type")]
     pub profile_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub video_codec: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_codec: Option<String>,
-    pub protocol: String, // e.g., "hls"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
     pub context: String,  // e.g., "Streaming"
+    pub protocol: String, // e.g., "hls"
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "string_or_number",
+        serialize_with = "number_to_string"
+    )]
+    pub max_audio_channels: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "string_or_number",
+        serialize_with = "number_to_string"
+    )]
+    pub min_segments: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub break_on_non_key_frames: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct CodecProfile {
+    #[serde(rename = "Type")]
+    pub profile_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub conditions: Vec<CodecCondition>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct CodecCondition {
+    pub condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>, // not sure if required or optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>, // not sure if required or optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_required: Option<bool>, // not sure if required or optional.
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct SubtitleProfile {
     pub format: String, // e.g., "srt", "vtt"
     pub method: String, // e.g., "External", "Hls", "Embed"
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct ResponseProfile {
+    #[serde(rename = "Type")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 //
@@ -216,7 +300,7 @@ pub struct MediaSource {
     /// The sub-protocol for transcoding (usually "hls").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoding_sub_protocol: Option<String>,
-    /// The container used for transcode segments (e.g., "ts" or "m4s").
+    /// The container used for transcode segments (e.g., "ts" or "mp4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcoding_container: Option<String>,
     /// How many ms the client should analyze the stream before playing.
