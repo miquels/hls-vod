@@ -53,7 +53,11 @@ pub(crate) fn generate_video_playlist(index: &StreamIndex) -> String {
 /// Generate audio variant playlist
 ///
 /// Creates a/<track_index>.m3u8 with segment references
-pub(crate) fn generate_audio_playlist(index: &StreamIndex, track_index: usize) -> String {
+pub(crate) fn generate_audio_playlist(
+    index: &StreamIndex,
+    track_index: usize,
+    requested_transcode: Option<&str>,
+) -> String {
     let mut output = String::new();
 
     // Calculate target duration
@@ -67,12 +71,14 @@ pub(crate) fn generate_audio_playlist(index: &StreamIndex, track_index: usize) -
     output.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
-    let transcode_to = index
-        .get_audio_stream(track_index)
-        .ok()
-        .and_then(|s| s.transcode_to)
-        .and_then(codec_name_short)
-        .map(String::from);
+    let transcode_to = requested_transcode.map(String::from).or_else(|| {
+        index
+            .get_audio_stream(track_index)
+            .ok()
+            .and_then(|s| s.transcode_to)
+            .and_then(codec_name_short)
+            .map(String::from)
+    });
 
     let init_seg = crate::params::AudioSegment {
         track_id: track_index,
@@ -108,6 +114,7 @@ pub(crate) fn generate_interleaved_playlist(
     index: &StreamIndex,
     video_idx: usize,
     audio_idx: usize,
+    requested_audio_transcode: Option<&str>,
 ) -> String {
     let mut output = String::new();
 
@@ -122,12 +129,14 @@ pub(crate) fn generate_interleaved_playlist(
     output.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
-    let audio_transcode_to = index
-        .get_audio_stream(audio_idx)
-        .ok()
-        .and_then(|s| s.transcode_to)
-        .and_then(codec_name_short)
-        .map(String::from);
+    let audio_transcode_to = requested_audio_transcode.map(String::from).or_else(|| {
+        index
+            .get_audio_stream(audio_idx)
+            .ok()
+            .and_then(|s| s.transcode_to)
+            .and_then(codec_name_short)
+            .map(String::from)
+    });
 
     let init_seg = crate::params::VideoSegment {
         track_id: video_idx,
@@ -359,7 +368,7 @@ mod tests {
     #[test]
     fn test_generate_audio_playlist() {
         let index = create_test_index();
-        let playlist = generate_audio_playlist(&index, 1);
+        let playlist = generate_audio_playlist(&index, 1, None);
 
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("#EXT-X-VERSION:7"));

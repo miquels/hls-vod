@@ -375,6 +375,7 @@ mod tests {
             audio_stream,
             segment,
             media.video_timebase,
+            true,
         )
         .unwrap();
 

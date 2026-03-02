@@ -22,8 +22,9 @@ fn debug_video_alex_pts_with_audio() {
     }
 
     println!("Generating Audio Segment 0 (track 1)...");
-    let audio_data = crate::segment::generator::generate_audio_segment(&index, 1, 0, &video_path)
-        .expect("Failed to generate audio segment");
+    let audio_data =
+        crate::segment::generator::generate_audio_segment(&index, 1, 0, &video_path, None)
+            .expect("Failed to generate audio segment");
 
     if let Some(pos) = audio_data.windows(4).position(|w| w == b"tfdt") {
         let tfdt_box = &audio_data[pos - 4..pos + 24];

@@ -186,6 +186,7 @@ impl PlaylistOrSegment {
                         &self.index,
                         p.track_id,
                         audio_idx,
+                        p.audio_transcode_to.as_deref(),
                     )
                 } else if self
                     .index
@@ -194,7 +195,11 @@ impl PlaylistOrSegment {
                     .any(|a| a.stream_index == p.track_id)
                 {
                     // Audio only playlist
-                    crate::playlist::variant::generate_audio_playlist(&self.index, p.track_id)
+                    crate::playlist::variant::generate_audio_playlist(
+                        &self.index,
+                        p.track_id,
+                        p.audio_transcode_to.as_deref(),
+                    )
                 } else if self
                     .index
                     // Subtitle only playlist
@@ -219,6 +224,7 @@ impl PlaylistOrSegment {
                             audio_idx,
                             segment,
                             &self.index.source_path,
+                            v.audio_transcode_to.as_deref(),
                         )
                         .map(|b| b.to_vec())?;
                         cache_it = true;
@@ -228,6 +234,7 @@ impl PlaylistOrSegment {
                             &self.index,
                             v.track_id,
                             audio_idx,
+                            v.audio_transcode_to.as_deref(),
                         )
                         .map(|b| b.to_vec())
                     }
@@ -253,13 +260,18 @@ impl PlaylistOrSegment {
                         a.track_id,
                         seq,
                         &self.index.source_path,
+                        a.transcode_to.as_deref(),
                     )
                     .map(|b| b.to_vec())?;
                     cache_it = true;
                     Ok(buf)
                 } else {
-                    crate::segment::generator::generate_audio_init_segment(&self.index, a.track_id)
-                        .map(|b| b.to_vec())
+                    crate::segment::generator::generate_audio_init_segment(
+                        &self.index,
+                        a.track_id,
+                        a.transcode_to.as_deref(),
+                    )
+                    .map(|b| b.to_vec())
                 }
             }
             UrlType::VttSegment(s) => {

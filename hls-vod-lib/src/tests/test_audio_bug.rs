@@ -17,6 +17,6 @@ fn test_audio_segment_3_bug() {
     println!("Audio streams: {:?}", index.audio_streams);
 
     // Test generating segment 0, track 3
-    let res = generate_audio_segment(&index, 3, 0, &video_path);
+    let res = generate_audio_segment(&index, 3, 0, &video_path, None);
     println!("Audio segment 3 result: {:?}", res.map(|b| b.len()));
 }

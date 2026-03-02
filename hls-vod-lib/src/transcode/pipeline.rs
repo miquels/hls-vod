@@ -45,6 +45,7 @@ pub fn transcode_audio_segment(
     audio_info: &AudioStreamInfo,
     segment: &SegmentInfo,
     video_timebase: ffmpeg::Rational,
+    shift_to_zero: bool,
 ) -> Result<(Vec<ffmpeg::codec::packet::Packet>, ffmpeg::Rational)> {
     let stream_index = audio_info.stream_index;
     let bitrate = get_recommended_bitrate(audio_info.channels);
@@ -236,13 +237,11 @@ pub fn transcode_audio_segment(
             let pkt_pts = pkt.pts().unwrap_or(0);
             // Drop packets that are entirely before our target segment boundary (pre-roll/primer)
             if pkt_pts >= target_grid_start_48k {
-                // Adjust packet timestamps to map directly onto the timeline expected by the segment
-                // The generator will patch tfdt.baseMediaDecodeTime to match `segment.start_pts`
-                // but local `moof` samples still must match the `tfdt` relative offsets.
-                // So we subtract the anchor.
-                let relative_pts = pkt_pts - target_grid_start_48k;
-                pkt.set_pts(Some(relative_pts));
-                pkt.set_dts(Some(relative_pts));
+                if shift_to_zero {
+                    let relative_pts = pkt_pts - target_grid_start_48k;
+                    pkt.set_pts(Some(relative_pts));
+                    pkt.set_dts(Some(relative_pts));
+                }
                 aac_packets.push(pkt);
             }
         }
@@ -254,9 +253,11 @@ pub fn transcode_audio_segment(
     for mut pkt in tail {
         let pkt_pts = pkt.pts().unwrap_or(0);
         if pkt_pts >= target_grid_start_48k {
-            let relative_pts = pkt_pts - target_grid_start_48k;
-            pkt.set_pts(Some(relative_pts));
-            pkt.set_dts(Some(relative_pts));
+            if shift_to_zero {
+                let relative_pts = pkt_pts - target_grid_start_48k;
+                pkt.set_pts(Some(relative_pts));
+                pkt.set_dts(Some(relative_pts));
+            }
             aac_packets.push(pkt);
         }
     }

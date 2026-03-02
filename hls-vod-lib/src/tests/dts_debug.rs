@@ -272,12 +272,12 @@ mod tests {
         let index = &media;
         let audio_stream = index.audio_streams.first().expect("No audio stream found");
 
-        let seg0_bytes = generate_audio_segment(index, 1, 0, &asset_path)
+        let seg0_bytes = generate_audio_segment(index, 1, 0, &asset_path, None)
             .expect("Failed to generate audio seg 0");
         let seg0 = parse_media_segment(&seg0_bytes);
         assert_eq!(seg0.base_decode_time, 0);
 
-        let seg1_bytes = generate_audio_segment(index, 1, 1, &asset_path)
+        let seg1_bytes = generate_audio_segment(index, 1, 1, &asset_path, None)
             .expect("Failed to generate audio seg 1");
         let seg1 = parse_media_segment(&seg1_bytes);
 
