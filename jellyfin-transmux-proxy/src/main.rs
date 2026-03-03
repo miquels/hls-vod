@@ -1,7 +1,11 @@
+use std::io;
+use std::sync::Arc;
+
 use axum::{routing::any, Router};
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use reqwest::Client;
-use std::sync::Arc;
+use socket2::{Socket, Domain, Type, Protocol};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -12,7 +16,7 @@ pub mod playbackinfo;
 pub mod proxy;
 pub mod types;
 
-use config::Config;
+use config::{listen_on_port, Config};
 use hls::proxymedia_handler;
 use playbackinfo::playback_info_handler;
 use proxy::{proxy_handler, websocket_handler};
@@ -24,9 +28,9 @@ struct Args {
     #[arg(short, long)]
     jellyfin_url: Option<String>,
 
-    /// Listen address for HTTP (CLI override)
+    /// Listen port for HTTP (CLI override)
     #[arg(short, long)]
-    listen: Option<String>,
+    port: Option<u16>,
 
     /// Media root directory to prepend to filesystem paths
     #[arg(short, long)]
@@ -44,6 +48,53 @@ pub struct AppState {
     pub safari_force_transcoding: bool,
 }
 
+
+// Helper to create a listener.
+fn tcp_listener(addr: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+
+    Ok(socket.into())
+}
+
+async fn watcher(watcher_config: RustlsConfig, cert: String, key: String) {
+    let mut last_modified = tokio::fs::metadata(&cert)
+        .await
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    loop {
+        // Sleep for 300 seconds (5 minutes)
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+        if let Ok(metadata) = tokio::fs::metadata(&cert).await {
+            if let Ok(new_modified) = metadata.modified() {
+                // Only reload if the file has been touched since our last check
+                if new_modified > last_modified {
+                    tracing::info!("Detected certificate change. Reloading...");
+
+                    match watcher_config.reload_from_pem_file(&cert, &key).await {
+                        Ok(_) => {
+                            last_modified = new_modified;
+                            tracing::info!("TLS Certificates reloaded successfully.");
+                        }
+                        Err(e) => tracing::error!("Failed to reload certificates: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -56,41 +107,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Load config if it exists
-    let config = if std::path::Path::new(&args.config).exists() {
+    let mut config = if std::path::Path::new(&args.config).exists() {
         tracing::info!("Loading config from {}", args.config);
-        Some(Config::load(&args.config)?)
+        Config::load(&args.config)?
     } else {
         tracing::info!("Config file {} not found, using CLI arguments", args.config);
-        None
+        Config::empty_config()
     };
 
     // Merge config and args
-    let jellyfin_url = args
-        .jellyfin_url
-        .or_else(|| config.as_ref().map(|c| c.jellyfin.jellyfin.clone()))
-        .unwrap_or_else(|| "http://jf.high5.nl:8096".to_string())
-        .trim_end_matches('/')
-        .to_string();
-
-    let mediaroot = args
-        .mediaroot
-        .or_else(|| config.as_ref().and_then(|c| c.jellyfin.mediaroot.clone()))
-        .unwrap_or_default();
-
-    let safari_force_transcoding = config
-        .as_ref()
-        .map(|c| c.safari.force_transcoding)
-        .unwrap_or(false);
+    if let Some(jellyfin_url) = &args.jellyfin_url {
+        config.jellyfin.jellyfin = jellyfin_url.to_string();
+    };
+    if let Some(mediaroot) = &args.mediaroot {
+        config.jellyfin.mediaroot = Some(mediaroot.to_string());
+    };
+    if let Some(port) = &args.port {
+        config.server.enable_http = true;
+        config.server.enable_https = false;
+        config.server.http_listen = listen_on_port(*port);
+    }
 
     let http_client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     let state = Arc::new(AppState {
-        jellyfin_url: jellyfin_url.clone(),
-        media_root: mediaroot,
+        jellyfin_url: config.jellyfin.jellyfin.clone(),
+        media_root: config.jellyfin.mediaroot.clone().unwrap_or_default(),
         http_client,
-        safari_force_transcoding,
+        safari_force_transcoding: config.safari.force_transcoding,
     });
 
     let app = Router::new()
@@ -115,70 +161,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut listeners = Vec::new();
 
-    // HTTP listener
-    let http_port = config.as_ref().and_then(|c| c.server.http_listen_port);
-    let http_addr_str = args
-        .listen
-        .clone()
-        .or_else(|| http_port.map(|p| format!("0.0.0.0:{}", p)));
-
-    if let Some(addr_str) = http_addr_str {
-        let addr: std::net::SocketAddr = addr_str.parse()?;
-        let app_clone = app.clone();
-        tracing::info!("Starting HTTP listener on {}", addr);
-        listeners.push(tokio::spawn(async move {
-            axum_server::bind(addr)
-                .serve(app_clone.into_make_service())
-                .await
-        }));
-    } else if config.is_none() && args.listen.is_none() {
-        // Default fallback ONLY if no config file was found and no --listen arg provided.
-        let addr: std::net::SocketAddr = "127.0.0.1:8097".parse()?;
-        let app_clone = app.clone();
-        tracing::info!("Starting default HTTP listener on {}", addr);
-        listeners.push(tokio::spawn(async move {
-            axum_server::bind(addr)
-                .serve(app_clone.into_make_service())
-                .await
-        }));
-    } else {
-        tracing::info!("HTTP listener disabled (none configured)");
-    }
-
-    // HTTPS listener
-    if let Some(c) = config.as_ref() {
-        if let Some(port) = c.server.https_listen_port {
-            let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-
-            match (&c.server.tls_cert, &c.server.tls_key) {
-                (Some(cert), Some(key)) => {
-                    tracing::info!("Starting HTTPS listener on {}", addr);
-                    let rustls_config =
-                        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
-                    let app_clone = app.clone();
-
-                    listeners.push(tokio::spawn(async move {
-                        axum_server::bind_rustls(addr, rustls_config)
-                            .serve(app_clone.into_make_service())
-                            .await
-                    }));
-                }
-                _ => {
-                    tracing::error!(
-                        "HTTPS listen port {} is configured, but tls_cert or tls_key is missing!",
-                        port
-                    );
-                    return Err("HTTPS configuration incomplete: missng cert or key".into());
-                }
-            }
-        } else {
-            tracing::info!("HTTPS listener disabled (no port configured)");
+    // HTTP listeners
+    if config.server.enable_http {
+        for addr in &config.server.http_listen {
+            let app_clone = app.clone();
+            tracing::info!("Starting HTTP listener on {}", addr);
+            let listener = tcp_listener(*addr)?;
+            listeners.push(tokio::spawn(async move {
+                axum_server::from_tcp(listener)?
+                    .serve(app_clone.into_make_service())
+                    .await
+            }));
         }
-    } else {
-        tracing::info!("HTTPS listener disabled (no config)");
     }
 
-    tracing::info!("Proxying to {}", jellyfin_url);
+    // HTTPS listeners
+    if config.server.enable_https {
+
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &config.server.tls_cert,
+            &config.server.tls_key,
+        ).await?;
+
+        let cert = config.server.tls_cert.clone();
+        let key = config.server.tls_key.clone();
+        let rustls_config_clone = rustls_config.clone();
+        tokio::spawn(async move {
+            watcher(rustls_config_clone, cert, key).await;
+        });
+
+        for addr in &config.server.https_listen {
+            tracing::info!("Starting HTTPS listener on {}", addr);
+            let app_clone = app.clone();
+            let rustls_config_clone = rustls_config.clone();
+            let listener = tcp_listener(*addr)?;
+            listeners.push(tokio::spawn(async move {
+                axum_server::from_tcp_rustls(listener, rustls_config_clone)?
+                    .serve(app_clone.into_make_service())
+                    .await
+            }));
+        }
+    }
+
+    tracing::info!("Proxying to {}", config.jellyfin.jellyfin);
 
     if listeners.is_empty() {
         tracing::error!("No listeners configured!");
