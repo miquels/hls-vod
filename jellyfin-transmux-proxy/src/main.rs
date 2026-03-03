@@ -5,7 +5,7 @@ use axum::{routing::any, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use reqwest::Client;
-use socket2::{Socket, Domain, Type, Protocol};
+use socket2::{Domain, Protocol, Socket, Type};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -47,7 +47,6 @@ pub struct AppState {
     pub http_client: Client,
     pub safari_force_transcoding: bool,
 }
-
 
 // Helper to create a listener.
 fn tcp_listener(addr: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
@@ -97,6 +96,11 @@ async fn watcher(watcher_config: RustlsConfig, cert: String, key: String) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Explicitly install the ring crypto provider for rustls 0.23+
+    // This avoids the "Could not automatically determine the process-level CryptoProvider" panic
+    // when multiple providers are enabled or when the environment is ambiguous.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -177,11 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTPS listeners
     if config.server.enable_https {
-
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
             &config.server.tls_cert,
             &config.server.tls_key,
-        ).await?;
+        )
+        .await?;
 
         let cert = config.server.tls_cert.clone();
         let key = config.server.tls_key.clone();
