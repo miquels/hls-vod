@@ -1,8 +1,8 @@
-# 🚀 HLS Transmuxer Suite
+# HLS Transmuxer Suite
 
 A collection of high-performance Rust tools and libraries designed for on-the-fly HLS transmuxing and audio transcoding.
 
-## 🌟 The Vision
+## Why.
 
 This project was born out of a specific need for a more efficient way to handle Jellyfin streaming. The standard pipeline of spawning external FFmpeg processes and writing segments to disk often results in high I/O overhead and sluggish seeking. 
 
@@ -10,7 +10,7 @@ This suite provides a native, in-memory alternative that significantly lowers se
 
 ---
 
-## 💎 Primary Project: [Jellyfin Transmux Proxy](./jellyfin-transmux-proxy/README.md)
+## Primary Project: [Jellyfin Transmux Proxy](./jellyfin-transmux-proxy/README.md)
 
 This is a specialized edge proxy that sits in front of your Jellyfin server. It intelligently intercepts playback requests and handles the media stream internally.
 
@@ -23,7 +23,7 @@ This is a specialized edge proxy that sits in front of your Jellyfin server. It 
 
 ---
 
-## 📦 Components
+## Components
 
 ### [hls-vod-lib](./hls-vod-lib/README.md)
 The engine under the hood. A standalone Rust crate for demuxing source files and packaging them into HLS-compliant fMP4 fragments. 🦀
@@ -31,17 +31,15 @@ The engine under the hood. A standalone Rust crate for demuxing source files and
 - **A/V Interleaving**: Perfectly synced streams for modern browser compatibility.
 
 ### [hls-vod-server](./hls-vod-server/README.md)
-A lightweight reference implementation. 🧪 
+A lightweight reference implementation.
 - **Proof-of-Concept**: Demonstrates how to use the library in a simple Axum server environment.
 - **Disclaimer**: For testing and reference only; use the Transmux Proxy for production.
 
 ---
 
-## 🛠️ Getting Started
+## Getting Started
 
 1. Clone the repository.
 2. Build the workspace: `cargo build --release`
 3. Configure your proxy using `jellyfix-transmux-proxy.toml`.
 4. Update your Jellyfin user settings to optimize for transmuxing.
-
-Enjoy a faster, leaner streaming experience! 🍿
