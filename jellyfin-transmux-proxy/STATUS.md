@@ -96,3 +96,30 @@
 - Patched `proxymedia_handler` to read the `stream_id` parameter and correctly hydrate `hls_url.session_id`.
 - Intercepted the `DELETE /Videos/ActiveEncodings` request within `proxy.rs`, pulling out the `playSessionId` query variable.
 - Invoked `hls_vod_lib::cache::remove_stream_by_id(session_id)` to gracefully clear active encoding tracking when playback is stopped early, returning `200 OK` on success, or appropriately falling back to the default proxy otherwise.
+
+## Milestone 11: Interleaved Transcoding & Manual Packet Interleaving
+**Status**: Completed
+
+**Summary:**
+- Resolved critical playback failures in Safari when streaming interleaved tracks with audio transcoding (AC-3 to AAC).
+- Implemented a manual "write-ahead" interleaving algorithm that pre-transcodes audio packets and merges them into the video packet stream in strict DTS order.
+- Fixed initialization segment generation for interleaved AC-3 tracks by enabling `delay_moov` and ingesting initial bitstream packets to construct a valid `moov` atom without `extradata`.
+- Ensured codec suffixes (e.g., `-aac`) are correctly propagated through HLS playlists for interleaved variants.
+
+## Milestone 12: Configuration System & Dual Listeners
+**Status**: Completed
+
+**Summary:**
+- Created a comprehensive configuration module (`src/config.rs`) to load proxy settings from `jellyfix-transmux-proxy.toml`.
+- Added support for concurrent HTTP and HTTPS listeners, allowing the proxy to act as a secure edge frontend.
+- Implemented configuration-driven Safari hacks, specifically the `force_transcoding` flag which dynamically strips direct play profiles from `PlaybackInfo` to resolve browser-specific compatibility issues.
+- Improved diagnostic logging to provide clear visibility into loaded configuration files and active listeners.
+
+## Milestone 13: Upstream TLS & Crypto Provider Standardization
+**Status**: Completed
+
+**Summary:**
+- Enabled full TLS support for upstream connections (`https://` and `wss://`) by configuring `rustls` features for `reqwest` and `tokio-tungstenite`.
+- Resolved a `rustls v0.23` `CryptoProvider` panic by standardizing the entire dependency graph on the `ring` crypto engine, avoiding provider conflicts at startup.
+- Finalized project documentation with descriptive READMEs for the proxy, the core `hls-vod-lib` engine, and the `hls-vod-server` reference POC.
+- Verified the final build and test suite, ensuring all systems are robust and production-ready.
