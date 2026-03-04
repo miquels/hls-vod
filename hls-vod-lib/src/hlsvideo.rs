@@ -84,9 +84,10 @@ pub struct MainPlaylist {
 /// HlsVideo audio/video/subtitle playlist or segment variant.
 ///
 /// This just generates the playlist or segment from the URL.
+#[derive(Debug, Clone)]
 pub struct PlaylistOrSegment {
-    hls_params: HlsParams,
-    index: Arc<StreamIndex>,
+    pub(crate) hls_params: HlsParams,
+    pub(crate) index: Arc<StreamIndex>,
 }
 
 impl PlaylistOrSegment {
@@ -234,7 +235,7 @@ impl PlaylistOrSegment {
     }
 
     /// Perform the actual generation (separated from caching/dedup logic).
-    fn do_generate(&self) -> crate::error::Result<(Vec<u8>, bool)> {
+    pub(crate) fn do_generate(&self) -> crate::error::Result<(Vec<u8>, bool)> {
         let mut cache_it = false;
 
         let data = match &self.hls_params.url_type {
@@ -351,11 +352,11 @@ impl PlaylistOrSegment {
         Ok((data, cache_it))
     }
 
-    /// Spawn a single background thread to pre-generate upcoming segments sequentially.
+    /// Add coming segments into the global threadpool's work queue.
     ///
-    /// Generating sequentially (not in parallel) avoids contention on the shared
-    /// FFmpeg input context mutex and disk I/O, which would otherwise double the
-    /// generation time per segment.
+    /// The global threadpool ensures look-ahead generation happens concurrently
+    /// across active streams but limits the total number of parallel FFmpeg processes
+    /// to avoid I/O blocking and extreme CPU usage.
     fn spawn_lookahead(&self) {
         let lookahead = crate::cache::segment_cache()
             .map(|c| c.lookahead())
@@ -367,19 +368,42 @@ impl PlaylistOrSegment {
 
         let total_segments = self.index.segment_count();
 
-        // Collect the params for segments that actually need generating.
-        let mut work: Vec<crate::params::HlsParams> = Vec::new();
+        // Check if we are generating a media segment and track the latest sequence.
+        let requested_seg_id = match &self.hls_params.url_type {
+            UrlType::VideoSegment(v) => v.segment_id,
+            UrlType::AudioSegment(a) => a.segment_id,
+            _ => None,
+        };
+
+        if let Some(n) = requested_seg_id {
+            let last = self
+                .index
+                .last_requested_segment
+                .swap(n as i64, std::sync::atomic::Ordering::Relaxed);
+
+            // Seek detection: if N is not a contiguous request, clear the queue.
+            // i.e., N != last + 1, and N != last
+            if last != -1 && n as i64 != last + 1 && n as i64 != last {
+                tracing::info!(stream_id = %self.index.stream_id, "seek detected: requested segment {}, last was {}", n, last);
+                if let Ok(mut q) = self.index.lookahead_queue.lock() {
+                    q.clear();
+                }
+            }
+        }
+
+        // Collect new tasks
+        let mut new_tasks = Vec::new();
         for offset in 1..=lookahead {
             let Some(next_params) = self.hls_params.with_segment_offset(offset) else {
                 break;
             };
 
-            // Check if the next segment_id is within bounds.
             let next_seg_id = match &next_params.url_type {
                 UrlType::VideoSegment(v) => v.segment_id,
                 UrlType::AudioSegment(a) => a.segment_id,
                 _ => None,
             };
+
             if let Some(id) = next_seg_id {
                 if id >= total_segments {
                     break; // past the end of the media
@@ -387,75 +411,30 @@ impl PlaylistOrSegment {
             }
 
             let next_key = next_params.to_string();
-            let stream_id = &self.index.stream_id;
 
-            // Skip if already cached.
+            // Fast cache check
             if let Some(c) = crate::cache::segment_cache() {
-                if c.get(stream_id, &next_key).is_some() {
+                if c.get(&self.index.stream_id, &next_key).is_some() {
                     continue;
                 }
             }
 
-            work.push(next_params);
+            new_tasks.push(next_params);
         }
 
-        if work.is_empty() {
-            return;
-        }
-
-        // Spawn ONE thread that generates all look-ahead segments sequentially.
-        let index = self.index.clone();
-        std::thread::spawn(move || {
-            for next_params in work {
-                let segment_key = next_params.to_string();
-                let stream_id = index.stream_id.clone();
-
-                tracing::debug!(
-                    segment_key = %segment_key,
-                    "look-ahead: starting pre-generation"
-                );
-
-                // Double-checked locking for dedup.
-                if let Some(c) = crate::cache::segment_cache() {
-                    if c.get(&stream_id, &segment_key).is_some() {
-                        continue; // already cached (player or earlier lookahead)
-                    }
-                    let lock = c.acquire_generation_lock(&stream_id, &segment_key);
-                    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    if c.get(&stream_id, &segment_key).is_some() {
-                        c.cleanup_generation_lock(&stream_id, &segment_key);
-                        continue; // completed by another thread
-                    }
-                }
-
-                let ps = PlaylistOrSegment {
-                    hls_params: next_params,
-                    index: index.clone(),
-                };
-
-                match ps.do_generate() {
-                    Ok((data, _)) => {
-                        if let Some(c) = crate::cache::segment_cache() {
-                            c.insert(&stream_id, &segment_key, bytes::Bytes::from(data));
-                            c.cleanup_generation_lock(&stream_id, &segment_key);
-                        }
-                        tracing::debug!(
-                            segment_key = %segment_key,
-                            "look-ahead: completed pre-generation"
-                        );
-                    }
-                    Err(e) => {
-                        if let Some(c) = crate::cache::segment_cache() {
-                            c.cleanup_generation_lock(&stream_id, &segment_key);
-                        }
-                        tracing::warn!(
-                            segment_key = %segment_key,
-                            error = %e,
-                            "look-ahead: pre-generation failed"
-                        );
+        if !new_tasks.is_empty() {
+            if let Ok(mut q) = self.index.lookahead_queue.lock() {
+                // Ensure we don't push duplicates that are already waiting
+                for task in new_tasks {
+                    let key = task.to_string();
+                    if !q.iter().any(|p| p.to_string() == key) {
+                        q.push_back(task);
                     }
                 }
             }
-        });
+
+            // Notify the global queue
+            crate::lookahead::notify_lookahead(self.index.clone());
+        }
     }
 }

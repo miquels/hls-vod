@@ -33,6 +33,8 @@ mod tests {
             segment_first_pts: Arc::new(Vec::new()),
             cached_context: None,
             cache_enabled: true,
+            last_requested_segment: AtomicI64::new(-1),
+            lookahead_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
         };
 
         let segment = SegmentInfo {

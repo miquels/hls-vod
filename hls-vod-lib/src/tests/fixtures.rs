@@ -131,6 +131,8 @@ impl TestMediaInfo {
             segment_first_pts: std::sync::Arc::new(Vec::new()),
             cached_context: None,
             cache_enabled: true,
+            last_requested_segment: std::sync::atomic::AtomicI64::new(-1),
+            lookahead_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
         };
 
         // Add video stream

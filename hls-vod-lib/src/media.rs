@@ -8,6 +8,7 @@
 //!     info.video_streams.len(), info.audio_streams.len());
 //! ```
 //!
+use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -205,6 +206,10 @@ pub struct StreamIndex {
     pub(crate) cached_context: Option<Arc<std::sync::Mutex<ffmpeg::format::context::Input>>>,
     /// Whether generated segments for this media should be aggressively cached and LRU bumped
     pub(crate) cache_enabled: bool,
+    /// The sequence number of the last explicitly requested segment, used for seek detection
+    pub(crate) last_requested_segment: AtomicI64,
+    /// Queue of pending look-ahead parameters to generate for this stream
+    pub(crate) lookahead_queue: std::sync::Mutex<VecDeque<crate::params::HlsParams>>,
 }
 
 impl std::fmt::Debug for StreamIndex {
@@ -249,6 +254,13 @@ impl Clone for StreamIndex {
             segment_first_pts: Arc::clone(&self.segment_first_pts),
             cached_context: self.cached_context.clone(),
             cache_enabled: self.cache_enabled,
+            last_requested_segment: AtomicI64::new(
+                self.last_requested_segment.load(Ordering::Relaxed),
+            ),
+            // A cloned StreamIndex doesn't share the same lookahead queue lock.
+            // If we actually share it widely, we would wrap this in Arc. Given usage,
+            // we will primarily rely on the original Arc<StreamIndex> for the global queue.
+            lookahead_queue: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -276,6 +288,8 @@ impl StreamIndex {
             segment_first_pts: Arc::new(Vec::new()),
             cached_context: None,
             cache_enabled: true,
+            last_requested_segment: AtomicI64::new(-1), // nothing requested yet
+            lookahead_queue: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 

@@ -23,6 +23,8 @@ chrono = "0.4"
 mp4 = "0.14.0"
 dashmap = "5.5"
 tokio = { version = "1.37", features = ["sync"] }
+crossbeam-channel = "0.5.15"
+num_cpus = "1.17.0"
 
 [dev-dependencies]
 tempfile = "3.9"

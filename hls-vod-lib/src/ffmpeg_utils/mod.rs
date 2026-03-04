@@ -25,7 +25,9 @@ pub fn init() -> Result<(), crate::error::FfmpegError> {
         crate::error::FfmpegError::InitFailed(format!("ffmpeg::init() failed: {}", e))
     })?;
 
-    tracing::info!("FFmpeg initialized");
+    crate::lookahead::init_workers();
+
+    tracing::info!("FFmpeg & Lookahead Threadpool initialized");
 
     Ok(())
 }

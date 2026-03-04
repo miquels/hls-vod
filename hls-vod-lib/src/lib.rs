@@ -25,7 +25,7 @@
 //! fn handle_request(url_path: &str) -> Result<Vec<u8>> {
 //!     // Parse the URL path.
 //!     let hls_params = hls_vod_lib::HlsParams::parse(&url_path)?;
-//! 
+//!
 //!     // Calculate path to video file.
 //!     let media_path = std::path::PathBuf::from(&format!("/{}", hls_params.video_url));
 //!
@@ -55,6 +55,7 @@ pub(crate) mod transcode;
 
 pub mod cache;
 pub mod hlsvideo;
+pub mod lookahead;
 pub mod media;
 pub mod params;
 
