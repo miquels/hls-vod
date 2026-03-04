@@ -11,6 +11,8 @@ pub struct Config {
     pub jellyfin: JellyfinConfig,
     #[serde(default)]
     pub safari: SafariConfig,
+    #[serde(default)]
+    pub cache: hls_vod_lib::cache::SegmentCacheConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -94,6 +96,7 @@ impl Config {
                 jellyfin: "http://localhost:8096".to_string(),
                 ..Default::default()
             },
+            cache: Default::default(),
         }
     }
 }

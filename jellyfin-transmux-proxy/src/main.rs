@@ -136,6 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
+    // Initialize FFmpeg and segment cache.
+    let _ = hls_vod_lib::ffmpeg_init();
+    hls_vod_lib::ffmpeg_log_filter();
+    hls_vod_lib::cache::init_segment_cache(config.cache.clone());
+    if config.cache.lookahead > 0 {
+        tracing::info!("Segment look-ahead: {} segments", config.cache.lookahead);
+    }
+
     let state = Arc::new(AppState {
         jellyfin_url: config.jellyfin.jellyfin.clone(),
         media_root: config.jellyfin.mediaroot.clone().unwrap_or_default(),

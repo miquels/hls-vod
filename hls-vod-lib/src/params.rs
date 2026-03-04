@@ -4,7 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// HlsParams contains a video playlist or segment decoded from a URL.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HlsParams {
     /// Enum of subtype.
     pub url_type: UrlType,
@@ -15,7 +15,7 @@ pub struct HlsParams {
 }
 
 /// Different types of encoded URLs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UrlType {
     MainPlaylist,
     Playlist(Playlist),
@@ -206,10 +206,40 @@ impl HlsParams {
             _ => "max-age=3600",
         }
     }
+
+    /// Create a new `HlsParams` for the next segment (segment_id + offset).
+    ///
+    /// Returns `None` for init segments, playlists, subtitles, or if no segment_id.
+    pub fn with_segment_offset(&self, offset: usize) -> Option<HlsParams> {
+        let new_url_type = match &self.url_type {
+            UrlType::VideoSegment(v) => v.segment_id.map(|id| {
+                UrlType::VideoSegment(VideoSegment {
+                    track_id: v.track_id,
+                    audio_track_id: v.audio_track_id,
+                    audio_transcode_to: v.audio_transcode_to.clone(),
+                    segment_id: Some(id + offset),
+                })
+            }),
+            UrlType::AudioSegment(a) => a.segment_id.map(|id| {
+                UrlType::AudioSegment(AudioSegment {
+                    track_id: a.track_id,
+                    transcode_to: a.transcode_to.clone(),
+                    segment_id: Some(id + offset),
+                })
+            }),
+            _ => None,
+        }?;
+
+        Some(HlsParams {
+            url_type: new_url_type,
+            session_id: self.session_id.clone(),
+            video_url: self.video_url.clone(),
+        })
+    }
 }
 
 /// A video segment.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VideoSegment {
     /// Track id.
     pub track_id: usize,
@@ -240,7 +270,7 @@ impl fmt::Display for VideoSegment {
 }
 
 /// An audio segment.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AudioSegment {
     /// Track id.
     pub track_id: usize,
@@ -266,7 +296,7 @@ impl fmt::Display for AudioSegment {
 }
 
 /// A vtt (subtitle) segment.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VttSegment {
     /// Track id.
     pub track_id: usize,
@@ -288,7 +318,7 @@ impl fmt::Display for VttSegment {
 }
 
 /// An audio / video / subtitle playlist.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Playlist {
     /// Track id.
     pub track_id: usize,

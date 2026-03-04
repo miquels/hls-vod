@@ -168,13 +168,73 @@ impl PlaylistOrSegment {
     /// Generate the playlist or segment.
     // TODO: returns Bytes instead of Vec<u8>
     pub fn generate(&self) -> crate::error::Result<Vec<u8>> {
-        // See if it's in the cache.
         let segment_key = self.hls_params.to_string();
+
+        // Fast path: check cache without locking.
         if let Some(c) = crate::cache::segment_cache() {
             if let Some(b) = c.get(&self.index.stream_id, &segment_key) {
+                // Continue the look-ahead chain even on cache hits,
+                // otherwise the chain breaks after `lookahead` segments.
+                self.spawn_lookahead();
                 return Ok(b.to_vec());
             }
         }
+
+        // For media segments, use double-checked locking to avoid
+        // duplicate generation (e.g. from look-ahead + player request).
+        let is_media_segment = self.is_media_segment();
+        if is_media_segment {
+            if let Some(c) = crate::cache::segment_cache() {
+                let lock = c.acquire_generation_lock(&self.index.stream_id, &segment_key);
+                let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+                // Re-check cache — another thread may have completed while we waited.
+                if let Some(b) = c.get(&self.index.stream_id, &segment_key) {
+                    c.cleanup_generation_lock(&self.index.stream_id, &segment_key);
+                    return Ok(b.to_vec());
+                }
+            }
+        }
+
+        // Generate the actual content.
+        let (data, cache_it) = self.do_generate()?;
+
+        // Insert into cache.
+        if cache_it {
+            if let Some(c) = crate::cache::segment_cache() {
+                c.insert(
+                    &self.index.stream_id,
+                    &segment_key,
+                    bytes::Bytes::from(data.clone()),
+                );
+                c.cleanup_generation_lock(&self.index.stream_id, &segment_key);
+            }
+        }
+
+        // Spawn look-ahead background generation.
+        if is_media_segment {
+            self.spawn_lookahead();
+        }
+
+        Ok(data)
+    }
+
+    /// Whether this request is for a media segment (not init segment or playlist).
+    fn is_media_segment(&self) -> bool {
+        matches!(
+            &self.hls_params.url_type,
+            crate::params::UrlType::VideoSegment(v) if v.segment_id.is_some()
+        ) || matches!(
+            &self.hls_params.url_type,
+            crate::params::UrlType::AudioSegment(a) if a.segment_id.is_some()
+        ) || matches!(
+            &self.hls_params.url_type,
+            crate::params::UrlType::VttSegment(_)
+        )
+    }
+
+    /// Perform the actual generation (separated from caching/dedup logic).
+    fn do_generate(&self) -> crate::error::Result<(Vec<u8>, bool)> {
         let mut cache_it = false;
 
         let data = match &self.hls_params.url_type {
@@ -288,16 +348,100 @@ impl PlaylistOrSegment {
             }
         }?;
 
-        if cache_it {
-            if let Some(c) = crate::cache::segment_cache() {
-                c.insert(
-                    &self.index.stream_id,
-                    &segment_key,
-                    bytes::Bytes::from(data.clone()),
-                );
-            }
+        Ok((data, cache_it))
+    }
+
+    /// Spawn background threads to pre-generate upcoming segments.
+    fn spawn_lookahead(&self) {
+        let lookahead = crate::cache::segment_cache()
+            .map(|c| c.lookahead())
+            .unwrap_or(0);
+
+        if lookahead == 0 {
+            return;
         }
 
-        Ok(data)
+        let total_segments = self.index.segment_count();
+
+        for offset in 1..=lookahead {
+            let Some(next_params) = self.hls_params.with_segment_offset(offset) else {
+                break;
+            };
+
+            // Check if the next segment_id is within bounds.
+            let next_seg_id = match &next_params.url_type {
+                UrlType::VideoSegment(v) => v.segment_id,
+                UrlType::AudioSegment(a) => a.segment_id,
+                _ => None,
+            };
+            if let Some(id) = next_seg_id {
+                if id >= total_segments {
+                    break; // past the end of the media
+                }
+            }
+
+            let next_key = next_params.to_string();
+            let stream_id = self.index.stream_id.clone();
+
+            // Skip if already cached.
+            if let Some(c) = crate::cache::segment_cache() {
+                if c.get(&stream_id, &next_key).is_some() {
+                    continue;
+                }
+            }
+
+            // Spawn a background thread to generate.
+            let index = self.index.clone();
+            std::thread::spawn(move || {
+                tracing::debug!(
+                    segment_key = %next_key,
+                    "look-ahead: starting pre-generation"
+                );
+                let ps = PlaylistOrSegment {
+                    hls_params: next_params,
+                    index,
+                };
+                // Use the same generate() path which handles dedup via generation locks.
+                // Do NOT recurse into spawn_lookahead from here (avoid chain reaction).
+                let segment_key = ps.hls_params.to_string();
+                let stream_id = ps.index.stream_id.clone();
+
+                // Double-checked locking (same as generate).
+                if let Some(c) = crate::cache::segment_cache() {
+                    if c.get(&stream_id, &segment_key).is_some() {
+                        return; // already cached
+                    }
+                    let lock = c.acquire_generation_lock(&stream_id, &segment_key);
+                    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if c.get(&stream_id, &segment_key).is_some() {
+                        c.cleanup_generation_lock(&stream_id, &segment_key);
+                        return; // completed by another thread
+                    }
+                }
+
+                match ps.do_generate() {
+                    Ok((data, _)) => {
+                        if let Some(c) = crate::cache::segment_cache() {
+                            c.insert(&stream_id, &segment_key, bytes::Bytes::from(data));
+                            c.cleanup_generation_lock(&stream_id, &segment_key);
+                        }
+                        tracing::debug!(
+                            segment_key = %segment_key,
+                            "look-ahead: completed pre-generation"
+                        );
+                    }
+                    Err(e) => {
+                        if let Some(c) = crate::cache::segment_cache() {
+                            c.cleanup_generation_lock(&stream_id, &segment_key);
+                        }
+                        tracing::warn!(
+                            segment_key = %segment_key,
+                            error = %e,
+                            "look-ahead: pre-generation failed"
+                        );
+                    }
+                }
+            });
+        }
     }
 }

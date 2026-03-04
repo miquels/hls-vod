@@ -5,7 +5,7 @@
 //! - a stream segment cache (optional).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -52,6 +52,10 @@ pub struct SegmentCacheConfig {
 
     /// Time-to-live for cached segments in seconds
     pub ttl_secs: u64,
+
+    /// Number of segments to pre-generate ahead (0 = disabled)
+    #[serde(default)]
+    pub lookahead: usize,
 }
 
 impl Default for SegmentCacheConfig {
@@ -60,6 +64,7 @@ impl Default for SegmentCacheConfig {
             max_memory_mb: 512,
             max_segments: 100, // ~400 seconds of content at 4s/segment
             ttl_secs: 300,     // 5 minutes
+            lookahead: 0,      // disabled by default
         }
     }
 }
@@ -106,9 +111,11 @@ impl CacheEntry {
 }
 
 /// LRU cache for HLS segments
-pub(crate) struct SegmentCache {
+pub struct SegmentCache {
     /// Cache entries (key -> entry)
     entries: DashMap<String, CacheEntry>,
+    /// Per-key generation locks for dedup (double-checked locking)
+    generation_locks: DashMap<String, Arc<Mutex<()>>>,
     /// Current memory usage in bytes
     memory_bytes: AtomicUsize,
     /// Cache configuration
@@ -120,6 +127,7 @@ impl SegmentCache {
     pub fn new(config: SegmentCacheConfig) -> Self {
         Self {
             entries: DashMap::new(),
+            generation_locks: DashMap::new(),
             memory_bytes: AtomicUsize::new(0),
             config,
         }
@@ -256,6 +264,30 @@ impl SegmentCache {
             oldest_entry_age_secs: oldest_age,
         }
     }
+
+    /// Acquire a per-key generation lock.
+    ///
+    /// Returns an `Arc<Mutex<()>>` that callers should lock before generating.
+    /// Multiple callers for the same key get the same mutex, enabling
+    /// double-checked locking to avoid duplicate generation.
+    pub fn acquire_generation_lock(&self, stream_id: &str, segment_key: &str) -> Arc<Mutex<()>> {
+        let key = Self::make_key(stream_id, segment_key);
+        self.generation_locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Remove a generation lock after the segment has been cached.
+    pub fn cleanup_generation_lock(&self, stream_id: &str, segment_key: &str) {
+        let key = Self::make_key(stream_id, segment_key);
+        self.generation_locks.remove(&key);
+    }
+
+    /// Get the configured look-ahead count.
+    pub fn lookahead(&self) -> usize {
+        self.config.lookahead
+    }
 }
 
 /// Cache statistics
@@ -273,8 +305,9 @@ impl Default for SegmentCache {
     }
 }
 
-pub(crate) static STREAMS_BY_ID: std::sync::OnceLock<dashmap::DashMap<String, std::sync::Arc<StreamIndex>>> =
-    std::sync::OnceLock::new();
+pub(crate) static STREAMS_BY_ID: std::sync::OnceLock<
+    dashmap::DashMap<String, std::sync::Arc<StreamIndex>>,
+> = std::sync::OnceLock::new();
 
 /// Retrieve a tracked media stream by its generated stream ID
 pub(crate) fn get_stream_by_id(stream_id: &str) -> Option<std::sync::Arc<StreamIndex>> {
@@ -433,4 +466,3 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 }
-

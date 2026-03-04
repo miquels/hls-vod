@@ -29,8 +29,17 @@
 # Settins for the Jellyfin server we proxy to.
 [jellyfin]
   # Jellyfin server.
-  jellyfin = "https://jf.high5.nl"
+  jellyfin = "http://127.0.0.1:8096"
 
   # Media root. Optional (also a command line option).
-  mediaroot = "/tmp"
+  # mediaroot = "/tmp"
 
+# Segment caching.
+[cache]
+  # Cache limits
+  max_memory_mb = 512
+  max_segments = 100
+  ttl_secs = 300
+
+  # generate segments in advance.
+  lookahead = 2

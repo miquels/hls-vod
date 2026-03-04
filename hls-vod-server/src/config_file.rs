@@ -141,6 +141,7 @@ impl ConfigFile {
                 max_memory_mb: self.cache.max_memory_mb,
                 max_segments: self.cache.max_segments,
                 ttl_secs: self.cache.ttl_secs,
+                lookahead: 0,
             },
             segment: crate::config::SegmentConfig {
                 target_duration_secs: self.segment.target_duration_secs,
