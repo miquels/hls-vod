@@ -246,16 +246,6 @@ impl Fmp4Muxer {
         let out_index = *self.stream_map.get(&input_index)?;
         self.output.stream(out_index).map(|s| s.time_base())
     }
-
-    /// Get the mp4 track_id (1-based) for an input stream index.
-    ///
-    /// mp4 track_ids are the 1-based output stream index.  This is needed to
-    /// match `traf/tfhd.track_id` entries in the media segment against the
-    /// video and audio streams when patching per-track.
-    pub fn get_output_track_id(&self, input_index: usize) -> Option<u32> {
-        let out_index = *self.stream_map.get(&input_index)?;
-        Some(out_index as u32 + 1)
-    }
 }
 
 /// Parse the first `elst` (edit list) `media_time` from fMP4 init segment bytes.

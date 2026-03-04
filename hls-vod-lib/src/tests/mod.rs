@@ -19,3 +19,4 @@ pub mod test_context_reuse;
 pub mod test_send;
 pub mod validation;
 pub mod validator_debug;
+pub mod dump_test;

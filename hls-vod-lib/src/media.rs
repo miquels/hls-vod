@@ -299,23 +299,6 @@ impl StreamIndex {
         self.segment_first_pts = Arc::new(v);
     }
 
-    pub(crate) fn set_segment_first_pts(&self, seq: usize, pts_90k: i64) {
-        if let Some(slot) = self.segment_first_pts.get(seq) {
-            slot.store(pts_90k, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn get_segment_first_pts(&self, seq: usize) -> Option<i64> {
-        self.segment_first_pts.get(seq).and_then(|slot| {
-            let v = slot.load(Ordering::Relaxed);
-            if v == i64::MIN {
-                None
-            } else {
-                Some(v)
-            }
-        })
-    }
-
     pub(crate) fn get_segment(
         &self,
         segment_type: &str,

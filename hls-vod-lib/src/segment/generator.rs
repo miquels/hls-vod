@@ -14,7 +14,6 @@ use crate::subtitle::decoder::is_bitmap_subtitle_codec;
 use crate::subtitle::extractor::SubtitleExtractor;
 use crate::subtitle::webvtt::{WebVttConfig, WebVttWriter};
 use crate::transcode::encoder::{get_recommended_bitrate, AacEncoder};
-use crate::transcode::pipeline::transcode_audio_segment;
 use crate::transcode::resampler::HLS_SAMPLE_RATE;
 
 /// Generate an initialization segment (init.mp4)
@@ -815,99 +814,6 @@ pub(crate) fn generate_subtitle_segment(
 /// Parse the minimum display PTS across all samples in a muxed fMP4 segment.
 /// Scans every moof/traf/tfdt/trun box and returns the smallest (tfdt + sample_CT) value.
 /// This is the earliest frame display time, used to align audio tfdt.
-pub fn read_first_display_pts(data: &[u8]) -> Option<i64> {
-    let mut first_display_pts: Option<i64> = None;
-    let mut current_tfdt: Option<i64> = None;
-
-    crate::segment::isobmff::walk_boxes(
-        data,
-        &[b"moof", b"traf"],
-        &mut |btype, payload| match btype {
-            b"tfdt" => {
-                if payload.is_empty() {
-                    return;
-                }
-                let version = payload[0];
-                current_tfdt = Some(if version == 1 && payload.len() >= 12 {
-                    i64::from_be_bytes(payload[4..12].try_into().unwrap())
-                } else if payload.len() >= 8 {
-                    u32::from_be_bytes(payload[4..8].try_into().unwrap()) as i64
-                } else {
-                    0
-                });
-            }
-            b"trun" => {
-                if let Some(tfdt) = current_tfdt {
-                    if payload.len() >= 12 {
-                        let trun_flags =
-                            u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
-                        let sample_count = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-
-                        let has_duration = trun_flags & 0x0100 != 0;
-                        let has_ct_offset = trun_flags & 0x0800 != 0;
-                        let mut entry_offset = 8;
-                        if trun_flags & 0x0001 != 0 {
-                            entry_offset += 4;
-                        }
-                        if trun_flags & 0x0004 != 0 {
-                            entry_offset += 4;
-                        }
-
-                        let mut per_sample_size = 0usize;
-                        let mut ct_field_offset = 0usize;
-
-                        if has_duration {
-                            per_sample_size += 4;
-                        }
-                        if trun_flags & 0x0200 != 0 {
-                            per_sample_size += 4;
-                        }
-                        if trun_flags & 0x0400 != 0 {
-                            per_sample_size += 4;
-                        }
-                        if has_ct_offset {
-                            ct_field_offset = per_sample_size;
-                            per_sample_size += 4;
-                        }
-
-                        let mut running_dts = tfdt;
-                        let mut off = entry_offset;
-                        for _ in 0..sample_count {
-                            if off + per_sample_size > payload.len() {
-                                break;
-                            }
-
-                            let mut sample_pts = running_dts;
-                            if has_ct_offset {
-                                let ct_bytes =
-                                    &payload[off + ct_field_offset..off + ct_field_offset + 4];
-                                let ct = i32::from_be_bytes(ct_bytes.try_into().unwrap());
-                                sample_pts += ct as i64;
-                            }
-
-                            first_display_pts = Some(match first_display_pts {
-                                Some(cur) => cur.min(sample_pts),
-                                None => sample_pts,
-                            });
-
-                            if has_duration {
-                                let dur_bytes = &payload[off..off + 4];
-                                let dur = u32::from_be_bytes(dur_bytes.try_into().unwrap());
-                                running_dts += dur as i64;
-                            }
-
-                            off += per_sample_size;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        },
-    );
-
-    first_display_pts
-}
-
 fn generate_media_segment_ffmpeg(
     segment: &SegmentInfo,
     segment_type: &str,
@@ -1286,21 +1192,38 @@ fn generate_media_segment_ffmpeg(
     let start_frag_seq = segment.sequence as u32 + 1;
 
     if is_interleaved {
-        let v_track = video_track_index.unwrap_or(0) as u32 + 1;
-        let a_track = audio_track_index.unwrap_or(0) as u32 + 1;
+        // MP4 track IDs are 1-based and follow the ORDER streams were added
+        // to the muxer, NOT the input stream indices. We always add video
+        // first (track_id=1) and audio second (track_id=2).
+        let v_track: u32 = 1;
+        let a_track: u32 = 2;
 
-        if transcode_audio_to_aac {
-            patch_tfdts_per_track(
-                &mut media_data,
-                start_frag_seq,
-                v_track,
-                a_track,
-                video_target_tfdt,
-                audio_target_tfdt,
-            );
+        // For interleaved segments, always use per-track tfdt patching
+        // because video and audio tracks have different timescales.
+        let audio_tfdt_for_patch = if transcode_audio_to_aac {
+            // Transcoded audio uses 90kHz timebase
+            audio_target_tfdt
         } else {
-            patch_tfdts(&mut media_data, video_target_tfdt, start_frag_seq);
-        }
+            // Non-transcoded audio: compute tfdt in the audio's native timebase
+            // (e.g., 1/48000 for AAC at 48kHz), NOT in 90kHz.
+            let a_idx = audio_track_index.unwrap_or(0);
+            if let Ok(audio_info) = index.get_audio_stream(a_idx) {
+                let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
+                crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
+                    .max(0) as u64
+            } else {
+                audio_target_tfdt
+            }
+        };
+
+        patch_tfdts_per_track(
+            &mut media_data,
+            start_frag_seq,
+            v_track,
+            a_track,
+            video_target_tfdt,
+            audio_tfdt_for_patch,
+        );
     } else {
         patch_tfdts(&mut media_data, video_target_tfdt, start_frag_seq);
     }
@@ -1309,6 +1232,19 @@ fn generate_media_segment_ffmpeg(
         .or(first_audio_dts)
         .or(first_packet_dts)
         .unwrap_or(0);
+
+    // Prepend 'styp' box (Required for HLS fMP4)
+    // Structure: Size (4), Type (4), Major Brand (4), Minor Version (4), Compatible Brands (4...)
+    // Uses "iso8" as major brand, "cmfc" (CMAF) and "iso8" as compatible.
+    let styp_box: [u8; 24] = [
+        0x00, 0x00, 0x00, 24, // Size (24 bytes)
+        b's', b't', b'y', b'p', // Type: styp
+        b'i', b's', b'o', b'8', // Major Brand: iso8
+        0x00, 0x00, 0x02, 0x00, // Minor Version: 512
+        b'i', b's', b'o', b'8', // Compatible: iso8
+        b'c', b'm', b'f', b'c', // Compatible: cmfc
+    ];
+    media_data.splice(0..0, styp_box);
 
     Ok(Bytes::from(media_data))
 }
