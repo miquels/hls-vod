@@ -370,16 +370,16 @@ mod tests {
         let segment = media.segments.first().unwrap();
 
         // transcode audio to aac
-        let (packets, _) = crate::transcode::pipeline::transcode_audio_segment(
+        let bytes = crate::segment::generator::generate_audio_segment(
+            &media,
+            audio_stream.stream_index,
+            segment.sequence,
             &asset_path,
-            audio_stream,
-            segment,
-            media.video_timebase,
-            true,
+            Some("aac"),
         )
         .unwrap();
 
-        assert!(!packets.is_empty(), "Expected some AAC packets");
+        assert!(!bytes.is_empty(), "Expected some AAC bytes");
 
         let m3u8 = get_master(&media, None);
         println!("MASTER PLAYLIST:\n{}", m3u8);

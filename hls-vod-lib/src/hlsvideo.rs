@@ -381,17 +381,31 @@ impl PlaylistOrSegment {
         };
 
         if let Some(n) = requested_seg_id {
-            let last = self
-                .index
-                .last_requested_segment
-                .swap(n as i64, std::sync::atomic::Ordering::Relaxed);
+            // Seek detection: we evaluate and update this INSIDE the lookahead_queue lock!
+            // This forces concurrent requests for N, N+1, N+2 (resulting from a seek)
+            // to be evaluated sequentially. The first one through (e.g. N) will detect the seek
+            // and clear the queue. The next one (N+1) will see `last` is now `N` and realize
+            // it's contiguous, preserving the queue.
+            if let Ok(mut q) = self.index.lookahead_queue.lock() {
+                let last = self
+                    .index
+                    .last_requested_segment
+                    .load(std::sync::atomic::Ordering::Relaxed);
 
-            // Seek detection: if N is not a contiguous request, clear the queue.
-            // i.e., N != last + 1, and N != last
-            if last != -1 && n as i64 != last + 1 && n as i64 != last {
-                tracing::info!(stream_id = %self.index.stream_id, "seek detected: requested segment {}, last was {}", n, last);
-                if let Ok(mut q) = self.index.lookahead_queue.lock() {
+                // If this request is discontinuous with the last request, it's a seek.
+                let is_seek = last != -1 && (n as i64 != last + 1) && (n as i64 != last);
+
+                if is_seek {
+                    tracing::info!(stream_id = %self.index.stream_id, "seek detected: requested segment {}, last was {}", n, last);
                     q.clear();
+                }
+
+                // Update the last requested segment if we are moving forward chronologically
+                // (This avoids back-to-back concurrent requests for N and N+1 from resetting it backward if N+1 hits the lock first)
+                if n as i64 > last {
+                    self.index
+                        .last_requested_segment
+                        .store(n as i64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

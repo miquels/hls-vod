@@ -8,7 +8,7 @@
 
 use ffmpeg_next as ffmpeg;
 
-use crate::error::{HlsError, Result};
+use crate::error::Result;
 use crate::media::{AudioStreamInfo, SegmentInfo};
 
 use super::decoder::AudioDecoder;
@@ -41,7 +41,9 @@ pub fn needs_transcoding(audio_stream: &AudioStreamInfo) -> bool {
 /// Packet timestamps are expressed in the AAC encoder's output timebase
 /// (1 / sample_rate).
 pub fn transcode_audio_segment(
-    source_path: &std::path::Path,
+    mut decoder: AudioDecoder,
+    audio_packets: Vec<ffmpeg::codec::packet::Packet>,
+    audio_timebase: ffmpeg::Rational,
     audio_info: &AudioStreamInfo,
     segment: &SegmentInfo,
     video_timebase: ffmpeg::Rational,
@@ -56,71 +58,15 @@ pub fn transcode_audio_segment(
         codec = ?audio_info.codec_id,
         start_pts = segment.start_pts,
         end_pts = segment.end_pts,
-        "transcode_audio_segment: starting"
+        "transcode_audio_segment: starting from memory buffer"
     );
 
-    // ── 1. Open source file ────────────────────────────────────────────────
-    let mut input = ffmpeg::format::input(source_path).map_err(|e| {
-        HlsError::Ffmpeg(crate::error::FfmpegError::OpenInput(format!(
-            "transcode_audio: failed to open {:?}: {}",
-            source_path, e
-        )))
-    })?;
-
-    // ── 2. Open decoder for the audio stream ──────────────────────────────
-    let stream = input.stream(stream_index).ok_or_else(|| {
-        HlsError::StreamNotFound(format!("audio stream {} not found", stream_index))
-    })?;
-
-    let mut decoder = AudioDecoder::open(&stream)?;
-    tracing::debug!(stream_index, "transcode_audio_segment: decoder opened");
-
-    // ── 3. Seek to segment start (with overlap to prime AAC encoder) ───────
-    let pre_roll_delay_seconds = 0.5;
-
-    // We aim to seek 0.5 seconds before the actual start PTS to collect primer frames
-    let target_start_ts_video = segment.start_pts;
-    let target_start_sec = target_start_ts_video as f64 * video_timebase.numerator() as f64
-        / video_timebase.denominator() as f64;
-    let seek_sec = (target_start_sec - pre_roll_delay_seconds).max(0.0);
-
-    let seek_ts = (seek_sec * 1_000_000.0) as i64;
-
-    input.seek(seek_ts, ..seek_ts).map_err(|e| {
-        HlsError::Ffmpeg(crate::error::FfmpegError::ReadFrame(format!(
-            "transcode_audio seek error: {}",
-            e
-        )))
-    })?;
-    tracing::debug!(seek_ts, "transcode_audio_segment: seeked");
-
-    // ── 4. Decode compressed packets into PCM frames ───────────────────────
-    let end_pts_90k = crate::ffmpeg_utils::utils::rescale_ts(
-        segment.end_pts,
-        video_timebase,
-        ffmpeg::Rational(1, 90000),
-    );
-
+    // ── Decode compressed packets into PCM frames ───────────────────────
     let mut pcm_frames: Vec<ffmpeg::util::frame::Audio> = Vec::new();
     let mut resampler: Option<AudioResampler> = None;
     let mut first_frame_pts_48k: Option<i64> = None;
 
-    for (stream, packet) in input.packets() {
-        if stream.index() != stream_index {
-            continue;
-        }
-
-        // Stop when we've passed the segment end
-        let pkt_pts = packet.pts().or(packet.dts()).unwrap_or(0);
-        let pkt_90k = crate::ffmpeg_utils::utils::rescale_ts(
-            pkt_pts,
-            stream.time_base(),
-            ffmpeg::Rational(1, 90000),
-        );
-        if pkt_90k >= end_pts_90k {
-            break;
-        }
-
+    for packet in audio_packets {
         decoder.send_packet(&packet)?;
 
         while let Some(frame) = decoder.receive_frame()? {
@@ -144,7 +90,7 @@ pub fn transcode_audio_segment(
                 let fr_pts = frame.pts().unwrap_or(0);
                 first_frame_pts_48k = Some(crate::ffmpeg_utils::utils::rescale_ts(
                     fr_pts,
-                    stream.time_base(),
+                    audio_timebase,
                     ffmpeg::Rational(1, HLS_SAMPLE_RATE as i32),
                 ));
             }
@@ -183,8 +129,6 @@ pub fn transcode_audio_segment(
         tracing::warn!(
             seq = segment.sequence,
             stream_index,
-            seek_ts,
-            end_pts_90k,
             "transcode_audio_segment: 0 PCM frames decoded - returning empty packet list"
         );
         return Ok((vec![], ffmpeg::Rational::new(1, HLS_SAMPLE_RATE as i32)));
