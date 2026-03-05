@@ -16,35 +16,218 @@ use crate::subtitle::webvtt::{WebVttConfig, WebVttWriter};
 use crate::transcode::encoder::{get_recommended_bitrate, AacEncoder};
 use crate::transcode::resampler::HLS_SAMPLE_RATE;
 
-/// Generate an initialization segment (init.mp4)
-#[allow(dead_code)] // we'll need this when we support multiplexed tracks
-pub(crate) fn generate_init_segment(index: &StreamIndex) -> Result<Bytes> {
-    let input = index.get_context()?;
+/// Builder for configuring and generating an initialization segment (`init.mp4`).
+pub(crate) struct InitSegmentBuilder<'a> {
+    index: &'a StreamIndex,
+    video_idx: Option<usize>,
+    audio_idx: Option<usize>,
+    transcode_audio_to_aac: bool,
+}
 
-    let mut muxer = Fmp4Muxer::new()?;
-
-    // Copy all video and audio streams
-    // Note: We need to iterate by index to map correctly
-    for stream in input.streams() {
-        let params = stream.parameters();
-        let codec_id = params.id();
-        let index = stream.index();
-
-        if crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
-            muxer.add_video_stream(&params, index)?;
-        } else if crate::ffmpeg_utils::utils::is_audio_codec(codec_id) {
-            muxer.add_audio_stream(&params, index)?;
+impl<'a> InitSegmentBuilder<'a> {
+    /// Create a new builder targeting the provided stream index.
+    pub fn new(index: &'a StreamIndex) -> Self {
+        Self {
+            index,
+            video_idx: None,
+            audio_idx: None,
+            transcode_audio_to_aac: false,
         }
     }
 
-    let mut data = muxer.write_header(false)?;
+    /// Add a generic rule to include all streams.
+    pub fn with_all_streams(self) -> Self {
+        // Technically this acts as a catch-all in `build()` if both are None,
+        // but for safety we specify explicit inclusion when building if needed.
+        self
+    }
 
-    // Fix default_sample_duration in trex boxes
-    // For mixed content, 1024 is a reasonable safe default, though not perfect for video
-    // But this function is primarily used for specific stream types now
-    fix_trex_durations(&mut data, 1024);
+    /// Add a video track by its internal FFmpeg stream index.
+    pub fn with_video_track(mut self, idx: usize) -> Self {
+        self.video_idx = Some(idx);
+        self
+    }
 
-    Ok(Bytes::from(data))
+    /// Add an audio track by its internal FFmpeg stream index.
+    pub fn with_audio_track(mut self, idx: usize) -> Self {
+        self.audio_idx = Some(idx);
+        self
+    }
+
+    /// Specify whether the audio track should be treated as transcode-to-AAC.
+    /// If true, the builder will use AAC codec parameters rather than source parameters.
+    pub fn transcode_audio_to_aac(mut self, transcode: bool) -> Self {
+        self.transcode_audio_to_aac = transcode;
+        self
+    }
+
+    /// Construct the initialization segment bytes.
+    pub fn build(self) -> Result<Bytes> {
+        let mut input = self.index.get_context()?;
+        let mut muxer = Fmp4Muxer::new()?;
+
+        let mut has_video = false;
+        let mut has_audio = false;
+
+        let mut video_params = None;
+        let mut audio_params = None;
+
+        let include_all = self.video_idx.is_none() && self.audio_idx.is_none();
+
+        // Pass 1: Collect stream parameters
+        for stream in input.streams() {
+            let params = stream.parameters();
+            let codec_id = params.id();
+            let idx = stream.index();
+
+            if crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
+                if include_all || self.video_idx == Some(idx) {
+                    video_params = Some((idx, params.clone()));
+                }
+            } else if crate::ffmpeg_utils::utils::is_audio_codec(codec_id) {
+                if include_all || self.audio_idx == Some(idx) {
+                    audio_params = Some((idx, params.clone()));
+                }
+            }
+        }
+
+        // Pass 2: Add streams to the muxer
+        if let Some((idx, vp)) = &video_params {
+            muxer.add_video_stream(vp, *idx)?;
+            has_video = true;
+        }
+
+        // If including all, we need to iterate again just for adding them all,
+        // because `video_params` and `audio_params` above only capture the *last* one if include_all is true.
+        // Let's refine the logic to support both modes elegantly:
+        if include_all {
+            has_video = false;
+            has_audio = false;
+            for stream in input.streams() {
+                let params = stream.parameters();
+                let codec_id = params.id();
+                let idx = stream.index();
+
+                if crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
+                    muxer.add_video_stream(&params, idx)?;
+                    has_video = true;
+                } else if crate::ffmpeg_utils::utils::is_audio_codec(codec_id) {
+                    muxer.add_audio_stream(&params, idx)?;
+                    has_audio = true;
+                }
+            }
+        } else {
+            if let Some((idx, ap)) = &audio_params {
+                if self.transcode_audio_to_aac {
+                    // Use AAC encoder parameters instead of source
+                    let audio_info = self.index.get_audio_stream(*idx);
+                    let bitrate =
+                        get_recommended_bitrate(audio_info.map(|a| a.channels).unwrap_or(2));
+                    let encoder = AacEncoder::open(HLS_SAMPLE_RATE, 2, bitrate)?;
+                    muxer.add_audio_stream(&encoder.codec_parameters(), *idx)?;
+                } else {
+                    muxer.add_audio_stream(ap, *idx)?;
+                }
+                has_audio = true;
+            }
+
+            if self.video_idx.is_some() && !has_video {
+                return Err(HlsError::StreamNotFound(
+                    "Video stream not found".to_string(),
+                ));
+            }
+            if self.audio_idx.is_some() && !has_audio {
+                return Err(HlsError::StreamNotFound(
+                    "Audio stream not found".to_string(),
+                ));
+            }
+        }
+
+        // Pass 3: Construct the MP4 bytes
+        // For codecs like AC-3 that don't have extradata, we must feed first packets to the muxer to generate `moov`.
+        // We skip this if transcoding to AAC because we already fed the AAC codec parameters explicitly.
+        let mut data = if self.transcode_audio_to_aac {
+            muxer.write_header(false)?
+        } else {
+            let mut first_video = None;
+            let mut first_audio = None;
+
+            for (s, mut pkt) in input.packets() {
+                let s_idx = s.index();
+
+                let is_target_video = (include_all
+                    && crate::ffmpeg_utils::utils::is_video_codec(s.parameters().id()))
+                    || self.video_idx == Some(s_idx);
+                let is_target_audio = (include_all
+                    && crate::ffmpeg_utils::utils::is_audio_codec(s.parameters().id()))
+                    || self.audio_idx == Some(s_idx);
+
+                if is_target_video && first_video.is_none() {
+                    if let Some(output_tb) = muxer.get_output_timebase(s_idx) {
+                        pkt.rescale_ts(s.time_base(), output_tb);
+                    }
+                    pkt.set_pts(Some(0));
+                    pkt.set_dts(Some(0));
+                    first_video = Some(pkt);
+                } else if is_target_audio && first_audio.is_none() {
+                    if let Some(output_tb) = muxer.get_output_timebase(s_idx) {
+                        pkt.rescale_ts(s.time_base(), output_tb);
+                    }
+                    pkt.set_pts(Some(0));
+                    pkt.set_dts(Some(0));
+                    first_audio = Some(pkt);
+                }
+
+                if (has_video == first_video.is_some()) && (has_audio == first_audio.is_some()) {
+                    break;
+                }
+            }
+
+            let mut packets = Vec::new();
+            if let Some(vp) = first_video {
+                packets.push(vp);
+            }
+            if let Some(ap) = first_audio {
+                packets.push(ap);
+            }
+
+            if !packets.is_empty() {
+                let refs: Vec<&mut ffmpeg::Packet> = packets.iter_mut().collect();
+                muxer
+                    .generate_init_segment_with_packets(refs)
+                    .map_err(|e| {
+                        HlsError::Muxing(format!(
+                            "Failed to generate init segment via packets: {}",
+                            e
+                        ))
+                    })?
+            } else {
+                muxer.write_header(false)?
+            }
+        };
+
+        // Pass 4: Fix TREX durations
+        let mut default_duration = 1024; // Safe fallback for audio/mixed
+        if has_video {
+            default_duration = 3000; // 30fps fallback
+            if let Some(video_info) = self.index.video_streams.first() {
+                let fps = video_info.framerate;
+                if fps.numerator() > 0 {
+                    default_duration =
+                        (90000 * fps.denominator() as u64 / fps.numerator() as u64) as u32;
+                }
+            }
+        }
+
+        crate::segment::isobmff::fix_trex_durations(&mut data, default_duration);
+        Ok(Bytes::from(data))
+    }
+}
+
+/// Generate an initialization segment (init.mp4)
+#[allow(dead_code)] // we'll need this when we support multiplexed tracks
+pub(crate) fn generate_init_segment(index: &StreamIndex) -> Result<Bytes> {
+    InitSegmentBuilder::new(index).with_all_streams().build()
 }
 
 /// Generate a video-only initialization segment
@@ -52,119 +235,34 @@ pub(crate) fn generate_video_init_segment(index: &StreamIndex) -> Result<Bytes> 
     if index.video_streams.is_empty() {
         return Err(HlsError::NoVideoStream);
     }
-
-    let input = index.get_context()?;
-
-    let mut muxer = Fmp4Muxer::new()?;
-
-    for stream in input.streams() {
-        let params = stream.parameters();
-        let codec_id = params.id();
-        let index = stream.index();
-
-        if crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
-            muxer.add_video_stream(&params, index)?;
-        }
+    // We assume the first video stream for the legacy helper, or all video streams if passing None.
+    // The previous implementation added ALL video streams.
+    // InitSegmentBuilder::with_all_streams combined with only video code is harder,
+    // but looking at original, it iterates streams and includes is_video.
+    // Let's manually recreate or just use `with_all_streams` for video?
+    // Actually the previous `generate_video_init_segment` only added video streams. Let's make a video-only fallback, or just grab the first index.
+    // The previous code explicitly checked for video_streams.is_empty() and added all video codecs.
+    let mut builder = InitSegmentBuilder::new(index);
+    if let Some(vi) = index.video_streams.first() {
+        builder = builder.with_video_track(vi.stream_index);
     }
-
-    let mut data = muxer.write_header(false)?;
-
-    // Calculate default duration (ticks) for video
-    // Assume 90kHz timescale for video
-    let mut default_duration = 3000; // Default fallback (30fps)
-
-    if let Some(video_info) = index.video_streams.first() {
-        let fps = video_info.framerate;
-        if fps.numerator() > 0 {
-            // Duration = 90000 / fps
-            // fps = num / den
-            // Duration = 90000 * den / num
-            default_duration = (90000 * fps.denominator() as u64 / fps.numerator() as u64) as u32;
-        }
-    }
-
-    fix_trex_durations(&mut data, default_duration);
-
-    Ok(Bytes::from(data))
+    builder.build()
 }
 
 /// Generate an audio-only initialization segment for a specific track
-///
-/// For tracks that need transcoding (non-AAC), the init segment is produced
-/// from the AAC encoder's codec parameters, not the source stream.
 pub(crate) fn generate_audio_init_segment(
     index: &StreamIndex,
     track_index: usize,
     requested_transcode: Option<&str>,
 ) -> Result<Bytes> {
-    // Check if this audio track needs transcoding
-    // TODO: add support for more codecs.
     let audio_info = index.get_audio_stream(track_index)?;
     let transcode_to_aac = requested_transcode == Some("aac")
         || audio_info.transcode_to == Some(ffmpeg::codec::Id::AAC);
 
-    if transcode_to_aac {
-        // Build an init segment with AAC codec parameters
-        let bitrate = get_recommended_bitrate(audio_info.channels);
-        let encoder = AacEncoder::open(HLS_SAMPLE_RATE, 2, bitrate)?;
-
-        let mut muxer = Fmp4Muxer::new()?;
-        muxer.add_audio_stream(&encoder.codec_parameters(), track_index)?;
-
-        let mut data = muxer.write_header(false)?;
-        fix_trex_durations(&mut data, 1024);
-        return Ok(Bytes::from(data));
-    }
-
-    // Source is already Native (AAC, AC3, Opus) — copy parameters directly
-    let mut input = index.get_context()?;
-
-    let mut muxer = Fmp4Muxer::new()?;
-
-    let stream = input
-        .stream(track_index)
-        .ok_or(HlsError::StreamNotFound(format!("Stream {}", track_index)))?;
-
-    if !crate::ffmpeg_utils::utils::is_audio_codec(stream.parameters().id()) {
-        return Err(HlsError::Muxing(format!(
-            "Stream {} is not an audio stream",
-            track_index
-        )));
-    }
-
-    muxer.add_audio_stream(&stream.parameters(), track_index)?;
-
-    // Find the first packet for this stream to provide bitstream info
-    // essential for writing the moov atom (especially for AC-3)
-    let mut first_packet = None;
-    for (s, mut pkt) in input.packets() {
-        if s.index() == track_index {
-            let input_tb = s.time_base();
-            if let Some(output_tb) = muxer.get_output_timebase(track_index) {
-                pkt.rescale_ts(input_tb, output_tb);
-            }
-            // Force PTS/DTS to 0 so FFmpeg doesn't generate an elst with a media_time delay
-            pkt.set_pts(Some(0));
-            pkt.set_dts(Some(0));
-            first_packet = Some(pkt);
-            break;
-        }
-    }
-
-    let mut data = if let Some(mut pkt) = first_packet {
-        muxer
-            .generate_init_segment_with_packet(&mut pkt)
-            .map_err(|e| {
-                HlsError::Muxing(format!("Failed to generate init segment via packet: {}", e))
-            })?
-    } else {
-        // Fallback for empty streams
-        muxer.write_header(false)?
-    };
-
-    fix_trex_durations(&mut data, 1024);
-
-    Ok(Bytes::from(data))
+    InitSegmentBuilder::new(index)
+        .with_audio_track(track_index)
+        .transcode_audio_to_aac(transcode_to_aac)
+        .build()
 }
 
 /// Generate an interleaved audio-video initialization segment
@@ -174,133 +272,17 @@ pub(crate) fn generate_interleaved_init_segment(
     audio_idx: usize,
     requested_audio_transcode: Option<&str>,
 ) -> Result<Bytes> {
-    if index.video_streams.is_empty() || index.audio_streams.is_empty() {
-        return Err(HlsError::StreamNotFound(
-            "Interleaved segment requires both video and audio streams".to_string(),
-        ));
-    }
-
-    // Only transcode if explicitly requested.
+    let audio_info = index.get_audio_stream(audio_idx).ok();
     let transcode_to_aac = requested_audio_transcode == Some("aac")
-        || index
-            .get_audio_stream(audio_idx)
+        || audio_info
             .map(|t| t.transcode_to == Some(ffmpeg::codec::Id::AAC))
             .unwrap_or(false);
 
-    let mut input = index.get_context()?;
-    let mut muxer = Fmp4Muxer::new()?;
-
-    let mut has_video = false;
-    let mut has_audio = false;
-
-    // Collect parameters first to avoid mutably borrowing input while iterating streams
-    let mut video_params = None;
-    let mut audio_params = None;
-
-    for stream in input.streams() {
-        let params = stream.parameters();
-        let codec_id = params.id();
-        let idx = stream.index();
-
-        if crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
-            if idx == video_idx {
-                video_params = Some(params.clone());
-            }
-        } else if crate::ffmpeg_utils::utils::is_audio_codec(codec_id) && idx == audio_idx {
-            audio_params = Some(params.clone());
-        }
-    }
-
-    if let Some(vp) = &video_params {
-        muxer.add_video_stream(vp, video_idx)?;
-        has_video = true;
-    }
-
-    if let Some(ap) = &audio_params {
-        if transcode_to_aac {
-            // Use AAC encoder parameters instead of source
-            let audio_info = index.get_audio_stream(audio_idx);
-            let bitrate = get_recommended_bitrate(audio_info.map(|a| a.channels).unwrap_or(2));
-            let encoder = AacEncoder::open(HLS_SAMPLE_RATE, 2, bitrate)?;
-            muxer.add_audio_stream(&encoder.codec_parameters(), audio_idx)?;
-        } else {
-            muxer.add_audio_stream(ap, audio_idx)?;
-        }
-        has_audio = true;
-    }
-
-    // Check if we found the requested streams
-    if !has_video || !has_audio {
-        return Err(HlsError::StreamNotFound(
-            "Specified video or audio stream not found".to_string(),
-        ));
-    }
-
-    let mut data = if transcode_to_aac {
-        muxer.write_header(false)?
-    } else {
-        // Fetch the first packet for video and audio to feed them to the muxer
-        let mut first_video = None;
-        let mut first_audio = None;
-
-        for (s, mut pkt) in input.packets() {
-            if s.index() == video_idx && first_video.is_none() {
-                if let Some(output_tb) = muxer.get_output_timebase(video_idx) {
-                    let input_tb = s.time_base();
-                    pkt.rescale_ts(input_tb, output_tb);
-                }
-                pkt.set_pts(Some(0));
-                pkt.set_dts(Some(0));
-                first_video = Some(pkt);
-            } else if s.index() == audio_idx && first_audio.is_none() {
-                if let Some(output_tb) = muxer.get_output_timebase(audio_idx) {
-                    let input_tb = s.time_base();
-                    pkt.rescale_ts(input_tb, output_tb);
-                }
-                pkt.set_pts(Some(0));
-                pkt.set_dts(Some(0));
-                first_audio = Some(pkt);
-            }
-            if first_video.is_some() && first_audio.is_some() {
-                break;
-            }
-        }
-
-        let mut packets = Vec::new();
-        if let Some(vp) = first_video {
-            packets.push(vp);
-        }
-        if let Some(ap) = first_audio {
-            packets.push(ap);
-        }
-
-        if !packets.is_empty() {
-            let refs: Vec<&mut ffmpeg::Packet> = packets.iter_mut().collect();
-            muxer
-                .generate_init_segment_with_packets(refs)
-                .map_err(|e| {
-                    HlsError::Muxing(format!(
-                        "Failed to generate interleaved init segment with packets: {}",
-                        e
-                    ))
-                })?
-        } else {
-            muxer.write_header(false)?
-        }
-    };
-
-    // Calculate default duration for video trex
-    let mut default_duration = 3000; // Default fallback (30fps)
-    if let Some(video_info) = index.video_streams.first() {
-        let fps = video_info.framerate;
-        if fps.numerator() > 0 {
-            default_duration = (90000 * fps.denominator() as u64 / fps.numerator() as u64) as u32;
-        }
-    }
-
-    fix_trex_durations(&mut data, default_duration);
-
-    Ok(Bytes::from(data))
+    InitSegmentBuilder::new(index)
+        .with_video_track(video_idx)
+        .with_audio_track(audio_idx)
+        .transcode_audio_to_aac(transcode_to_aac)
+        .build()
 }
 
 pub(crate) fn generate_interleaved_segment(
@@ -331,147 +313,6 @@ pub(crate) fn generate_interleaved_segment(
         index,
         transcode_to_aac,
     )
-}
-
-/// Fix default_sample_duration in trex boxes
-/// FFmpeg with stream copy sets duration to 1, but players need reasonable values
-fn fix_trex_durations(data: &mut Vec<u8>, duration: u32) {
-    crate::segment::isobmff::walk_boxes_mut(data, &[b"moov", b"mvex"], &mut |btype, payload| {
-        if btype == b"trex" && payload.len() >= 16 {
-            // Set default_sample_duration (offset 16 from start of payload, which is pos + 24 from start of box)
-            // Wait, in the original code, it was offset 20 from pos. payload starts at pos + 8. So it's offset 12 in payload.
-            payload[12..16].copy_from_slice(&duration.to_be_bytes());
-        }
-    });
-}
-
-/// Patch tfdt.baseMediaDecodeTime and mfhd.FragmentSequenceNumber in media segment data.
-///
-/// Sets all tfdt boxes so the first one matches `target_time` and subsequent
-/// ones are adjusted by the same delta (preserving relative offsets for
-/// multi-fragment segments). Also patches mfhd sequence numbers starting from
-/// `start_frag_seq`.
-fn patch_tfdts(media_data: &mut Vec<u8>, target_time: u64, start_frag_seq: u32) {
-    let mut tfdt_delta: Option<i64> = None;
-    let mut frag_count = 0;
-
-    crate::segment::isobmff::walk_boxes_mut(
-        media_data,
-        &[b"moof", b"traf"],
-        &mut |btype, payload| {
-            if btype == b"moof" {
-                // moof is a container, nothing to mutate directly here.
-            } else if btype == b"mfhd" {
-                let current_frag_seq = start_frag_seq.wrapping_add(frag_count);
-                frag_count += 1;
-                if payload.len() >= 8 {
-                    payload[4..8].copy_from_slice(&current_frag_seq.to_be_bytes());
-                }
-            } else if btype == b"tfdt" {
-                if payload.is_empty() {
-                    return;
-                }
-                let version = payload[0];
-                let (current_tfdt, value_offset) = if version == 1 && payload.len() >= 12 {
-                    (u64::from_be_bytes(payload[4..12].try_into().unwrap()), 4)
-                } else if payload.len() >= 8 {
-                    (
-                        u32::from_be_bytes(payload[4..8].try_into().unwrap()) as u64,
-                        4,
-                    )
-                } else {
-                    (0, 0)
-                };
-
-                if value_offset > 0 {
-                    if tfdt_delta.is_none() {
-                        tfdt_delta = Some(target_time as i64 - current_tfdt as i64);
-                    }
-                    let new_tfdt = (current_tfdt as i64 + tfdt_delta.unwrap()) as u64;
-                    if version == 1 {
-                        payload[4..12].copy_from_slice(&new_tfdt.to_be_bytes());
-                    } else {
-                        payload[4..8].copy_from_slice(&(new_tfdt as u32).to_be_bytes());
-                    }
-                }
-            }
-        },
-    );
-}
-
-/// Patch `mfhd` sequence numbers AND each track's `tfdt` independently.
-///
-/// For interleaved (multi-track) segments, `delay_moov=true` causes FFmpeg to
-/// shift all timestamps to start near 0.  We must restore the correct target
-/// decode-time for each track separately using its `trak_id` from `tfhd`.
-///
-/// `video_track_id` / `audio_track_id` are the 1-based mp4 track IDs emitted
-/// by the muxer (not the source stream indices).
-fn patch_tfdts_per_track(
-    media_data: &mut Vec<u8>,
-    start_frag_seq: u32,
-    video_track_id: u32,
-    audio_track_id: u32,
-    video_target_tfdt: u64,
-    audio_target_tfdt: u64,
-) {
-    let mut frag_count = 0u32;
-    // Track the last track_id we read from tfhd
-    let mut current_track_id: u32 = 0;
-
-    let mut video_tfdt_delta: Option<i64> = None;
-    let mut audio_tfdt_delta: Option<i64> = None;
-
-    crate::segment::isobmff::walk_boxes_mut(
-        media_data,
-        &[b"moof", b"traf"],
-        &mut |btype, payload| {
-            if btype == b"mfhd" && payload.len() >= 8 {
-                let seq = start_frag_seq.wrapping_add(frag_count);
-                frag_count += 1;
-                payload[4..8].copy_from_slice(&seq.to_be_bytes());
-            } else if btype == b"tfhd" && payload.len() >= 8 {
-                // tfhd layout: version(1) + flags(3) + track_id(4)
-                current_track_id = u32::from_be_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
-            } else if btype == b"tfdt" && !payload.is_empty() {
-                let version = payload[0];
-                let (current_tfdt, value_offset) = if version == 1 && payload.len() >= 12 {
-                    (u64::from_be_bytes(payload[4..12].try_into().unwrap()), 4)
-                } else if payload.len() >= 8 {
-                    (
-                        u32::from_be_bytes(payload[4..8].try_into().unwrap()) as u64,
-                        4,
-                    )
-                } else {
-                    (0, 0)
-                };
-
-                if value_offset > 0 {
-                    if current_track_id == video_track_id {
-                        if video_tfdt_delta.is_none() {
-                            video_tfdt_delta = Some(video_target_tfdt as i64 - current_tfdt as i64);
-                        }
-                        let new_tfdt = (current_tfdt as i64 + video_tfdt_delta.unwrap()) as u64;
-                        if version == 1 {
-                            payload[4..12].copy_from_slice(&new_tfdt.to_be_bytes());
-                        } else {
-                            payload[4..8].copy_from_slice(&(new_tfdt as u32).to_be_bytes());
-                        }
-                    } else if current_track_id == audio_track_id {
-                        if audio_tfdt_delta.is_none() {
-                            audio_tfdt_delta = Some(audio_target_tfdt as i64 - current_tfdt as i64);
-                        }
-                        let new_tfdt = (current_tfdt as i64 + audio_tfdt_delta.unwrap()) as u64;
-                        if version == 1 {
-                            payload[4..12].copy_from_slice(&new_tfdt.to_be_bytes());
-                        } else {
-                            payload[4..8].copy_from_slice(&(new_tfdt as u32).to_be_bytes());
-                        }
-                    }
-                }
-            }
-        },
-    );
 }
 
 pub(crate) fn generate_video_segment(
@@ -622,7 +463,7 @@ fn generate_transcoded_audio_segment(
     // Each segment gets its own ID. We use segment.sequence + 1 to be contiguous (1-based).
     let start_frag_seq = segment.sequence as u32 + 1;
 
-    patch_tfdts(&mut media_data, target_time, start_frag_seq);
+    crate::segment::isobmff::patch_tfdts(&mut media_data, target_time, start_frag_seq);
 
     Ok(Bytes::from(media_data))
 }
@@ -811,138 +652,31 @@ pub(crate) fn generate_subtitle_segment(
     Ok(bytes)
 }
 
-/// Parse the minimum display PTS across all samples in a muxed fMP4 segment.
-/// Scans every moof/traf/tfdt/trun box and returns the smallest (tfdt + sample_CT) value.
-/// This is the earliest frame display time, used to align audio tfdt.
-fn generate_media_segment_ffmpeg(
+pub(crate) struct BufferedPacket {
+    pub stream_id: usize,
+    pub packet: ffmpeg::Packet,
+    pub timebase: ffmpeg::Rational,
+    pub is_video_stream: bool,
+}
+
+fn buffer_media_packets(
+    input: &mut ffmpeg::format::context::Input,
     segment: &SegmentInfo,
     segment_type: &str,
-    video_track_index: Option<usize>,
+    video_timebase: ffmpeg::Rational,
+    stream_indices: &[usize],
     audio_track_index: Option<usize>,
-    index: &StreamIndex,
-    transcode_audio_to_aac: bool,
-) -> Result<Bytes> {
-    let is_interleaved = segment_type == "av";
-    let video_timebase = index.video_timebase;
-
-    let target_start_sec = segment.start_pts as f64 * video_timebase.numerator() as f64
-        / video_timebase.denominator() as f64;
-    let seek_sec = if is_interleaved && transcode_audio_to_aac {
-        (target_start_sec - 0.5).max(0.0)
-    } else {
-        target_start_sec
-    };
-    let seek_ts = (seek_sec * 1_000_000.0) as i64;
-    tracing::debug!("seek_ts_us={}", seek_ts);
-
-    let mut input = index.get_context()?;
-    input
-        .seek(seek_ts, ..seek_ts)
-        .map_err(|e| HlsError::Ffmpeg(crate::error::FfmpegError::ReadFrame(e.to_string())))?;
-
-    let mut muxer = Fmp4Muxer::new()?;
-
-    let mut stream_indices = Vec::new();
-    for stream in input.streams() {
-        let params = stream.parameters();
-        let codec_id = params.id();
-        let idx = stream.index();
-
-        if is_interleaved {
-            if let Some(video_idx) = video_track_index {
-                if idx == video_idx && crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
-                    muxer.add_video_stream(&params, idx)?;
-                    stream_indices.push(idx);
-                }
-            }
-            if let Some(audio_idx) = audio_track_index {
-                if idx == audio_idx && crate::ffmpeg_utils::utils::is_audio_codec(codec_id) {
-                    let audio_info = index.get_audio_stream(audio_idx)?;
-                    if transcode_audio_to_aac {
-                        let bitrate = get_recommended_bitrate(audio_info.channels);
-                        let encoder = AacEncoder::open(HLS_SAMPLE_RATE, 2, bitrate)?;
-                        muxer.add_audio_stream(&encoder.codec_parameters(), idx)?;
-                    } else {
-                        muxer.add_audio_stream(&params, idx)?;
-                    }
-                    stream_indices.push(idx);
-                }
-            }
-        } else {
-            let is_video =
-                segment_type == "video" && crate::ffmpeg_utils::utils::is_video_codec(codec_id);
-            let is_audio =
-                segment_type == "audio" && crate::ffmpeg_utils::utils::is_audio_codec(codec_id);
-
-            if is_video || is_audio {
-                if let Some(target) = video_track_index.or(audio_track_index) {
-                    if idx != target {
-                        continue;
-                    }
-                }
-                if is_video {
-                    muxer.add_video_stream(&params, idx)?;
-                } else {
-                    muxer.add_audio_stream(&params, idx)?;
-                }
-                stream_indices.push(idx);
-                break;
-            }
-        }
-    }
-
-    if stream_indices.is_empty() {
-        return Err(HlsError::StreamNotFound(format!(
-            "No {} stream found",
-            segment_type
-        )));
-    }
-
-    let _init_bytes = muxer.write_header(segment_type == "av" || segment_type == "audio")?;
-
-    let encoder_delay: i64 = if segment_type == "audio" {
-        if let Some(target) = audio_track_index {
-            index
-                .audio_streams
-                .iter()
-                .find(|a| a.stream_index == target)
-                .map(|a| a.encoder_delay)
-                .unwrap_or(0)
-        } else {
-            index
-                .audio_streams
-                .first()
-                .map(|a| a.encoder_delay)
-                .unwrap_or(0)
-        }
-    } else {
-        0
-    };
-
-    // ── 1. Buffer Packets into Memory ──
+) -> Vec<BufferedPacket> {
     let mut buffered_packets = Vec::new();
-    let mut audio_decoder = None;
+    let is_interleaved = segment_type == "av";
 
-    if is_interleaved && transcode_audio_to_aac {
-        if let Some(audio_idx) = audio_track_index {
-            if let Some(s) = input.stream(audio_idx) {
-                audio_decoder = Some(crate::transcode::decoder::AudioDecoder::open(&s)?);
-            }
-        }
-    }
-
-    let start_pts_90k = crate::ffmpeg_utils::utils::rescale_ts(
-        segment.start_pts,
-        video_timebase,
-        ffmpeg::Rational(1, 90000),
-    );
     let end_pts_90k = crate::ffmpeg_utils::utils::rescale_ts(
         segment.end_pts,
         video_timebase,
         ffmpeg::Rational(1, 90000),
     );
 
-    let mut _packet_count = 0;
+    let mut packet_count = 0;
 
     for (stream, packet) in input.packets() {
         let stream_id = stream.index();
@@ -965,15 +699,11 @@ fn generate_media_segment_ffmpeg(
         } else {
             if !is_interleaved {
                 if pts_90k >= end_pts_90k {
-                    if _packet_count > 0 {
+                    if packet_count > 0 {
                         break;
                     } else {
                         continue;
                     }
-                }
-            } else {
-                if pts_90k >= end_pts_90k {
-                    break;
                 }
             }
         }
@@ -988,41 +718,46 @@ fn generate_media_segment_ffmpeg(
             continue;
         }
 
-        buffered_packets.push((
+        buffered_packets.push(BufferedPacket {
             stream_id,
             packet,
-            stream.time_base().clone(),
+            timebase: stream.time_base().clone(),
             is_video_stream,
-        ));
-        _packet_count += 1;
+        });
+        packet_count += 1;
     }
 
-    // ── 2. DROP Mutex ──
-    std::mem::drop(input);
+    buffered_packets
+}
 
-    // ── 3. Transcode Audio in RAM (No Mutex!) ──
+fn transcode_audio_if_needed(
+    input: &mut ffmpeg::format::context::Input,
+    index: &StreamIndex,
+    audio_track_index: Option<usize>,
+    transcode_audio_to_aac: bool,
+    buffered_packets: &[BufferedPacket],
+    segment: &SegmentInfo,
+    video_timebase: ffmpeg::Rational,
+) -> Result<(Vec<ffmpeg::Packet>, Option<ffmpeg::Rational>)> {
     let mut transcoded_audio_packets = Vec::new();
     let mut audio_output_tb = None;
-    let mut audio_packet_idx = 0;
 
-    if is_interleaved && transcode_audio_to_aac {
+    if transcode_audio_to_aac {
         if let Some(audio_idx) = audio_track_index {
-            let audio_info = index.get_audio_stream(audio_idx)?;
-            let raw_audio_packets: Vec<_> = buffered_packets
-                .iter()
-                .filter(|(idx, _, _, _)| *idx == audio_idx)
-                .map(|(_, p, _, _)| p.clone())
-                .collect();
+            if let Some(s) = input.stream(audio_idx) {
+                let decoder = crate::transcode::decoder::AudioDecoder::open(&s)?;
+                let audio_info = index.get_audio_stream(audio_idx)?;
+                let raw_audio_packets: Vec<_> = buffered_packets
+                    .iter()
+                    .filter(|p| p.stream_id == audio_idx)
+                    .map(|p| p.packet.clone())
+                    .collect();
 
-            let mut audio_tb = ffmpeg::Rational(1, 90000);
-            if let Some((_, _, tb, _)) = buffered_packets
-                .iter()
-                .find(|(idx, _, _, _)| *idx == audio_idx)
-            {
-                audio_tb = *tb;
-            }
+                let mut audio_tb = ffmpeg::Rational(1, 90000);
+                if let Some(p) = buffered_packets.iter().find(|p| p.stream_id == audio_idx) {
+                    audio_tb = p.timebase;
+                }
 
-            if let Some(decoder) = audio_decoder {
                 let (aac_packets, output_tb) = crate::transcode::pipeline::transcode_audio_segment(
                     decoder,
                     raw_audio_packets,
@@ -1038,46 +773,78 @@ fn generate_media_segment_ffmpeg(
         }
     }
 
+    Ok((transcoded_audio_packets, audio_output_tb))
+}
+
+fn mux_media_segment(
+    segment_type: &str,
+    is_interleaved: bool,
+    transcode_audio_to_aac: bool,
+    video_timebase: ffmpeg::Rational,
+    segment: &SegmentInfo,
+    mut muxer: Fmp4Muxer,
+    buffered_packets: Vec<BufferedPacket>,
+    audio_track_index: Option<usize>,
+    mut transcoded_audio_packets: Vec<ffmpeg::Packet>,
+    audio_output_tb: Option<ffmpeg::Rational>,
+) -> Result<(Fmp4Muxer, Option<i64>, Option<i64>, Option<i64>)> {
+    let start_pts_90k = crate::ffmpeg_utils::utils::rescale_ts(
+        segment.start_pts,
+        video_timebase,
+        ffmpeg::Rational(1, 90000),
+    );
+
     let mut first_packet_dts: Option<i64> = None;
     let mut first_video_dts: Option<i64> = None;
     let mut first_audio_dts: Option<i64> = None;
 
-    let mut write_transcoded_audio_upto = |target_dts_90k: i64,
-                                           muxer: &mut Fmp4Muxer,
-                                           first_dts_ref: &mut Option<i64>,
-                                           overall_first_dts_ref: &mut Option<i64>|
-     -> Result<()> {
-        if !transcoded_audio_packets.is_empty() && audio_packet_idx < transcoded_audio_packets.len()
-        {
-            let tb = audio_output_tb.unwrap();
-            let audio_idx = audio_track_index.unwrap();
+    let mut audio_packet_idx = 0;
 
-            while audio_packet_idx < transcoded_audio_packets.len() {
-                let pkt = &mut transcoded_audio_packets[audio_packet_idx];
-                let pkt_dts = pkt.dts().or(pkt.pts()).unwrap_or(0);
-                let pkt_dts_90k =
-                    crate::ffmpeg_utils::utils::rescale_ts(pkt_dts, tb, ffmpeg::Rational(1, 90000));
+    // We can't capture mut muxer in a closure easily if we return it later,
+    // so we just define a helper nested or inline macro.
+    macro_rules! write_transcoded_audio_upto {
+        ($target_dts_90k:expr) => {
+            if !transcoded_audio_packets.is_empty()
+                && audio_packet_idx < transcoded_audio_packets.len()
+            {
+                let tb = audio_output_tb.unwrap();
+                let audio_idx = audio_track_index.unwrap();
 
-                if pkt_dts_90k <= target_dts_90k {
-                    if overall_first_dts_ref.is_none() {
-                        *overall_first_dts_ref = Some(pkt_dts);
+                while audio_packet_idx < transcoded_audio_packets.len() {
+                    let pkt = &mut transcoded_audio_packets[audio_packet_idx];
+                    let pkt_dts = pkt.dts().or(pkt.pts()).unwrap_or(0);
+                    let pkt_dts_90k = crate::ffmpeg_utils::utils::rescale_ts(
+                        pkt_dts,
+                        tb,
+                        ffmpeg::Rational(1, 90000),
+                    );
+
+                    if pkt_dts_90k <= $target_dts_90k {
+                        if first_packet_dts.is_none() {
+                            first_packet_dts = Some(pkt_dts);
+                        }
+                        if first_audio_dts.is_none() {
+                            first_audio_dts = Some(pkt_dts);
+                        }
+
+                        pkt.set_stream(audio_idx);
+                        muxer.write_packet(pkt)?;
+                        audio_packet_idx += 1;
+                    } else {
+                        break;
                     }
-                    if first_dts_ref.is_none() {
-                        *first_dts_ref = Some(pkt_dts);
-                    }
-
-                    pkt.set_stream(audio_idx);
-                    muxer.write_packet(pkt)?;
-                    audio_packet_idx += 1;
-                } else {
-                    break;
                 }
             }
-        }
-        Ok(())
-    };
+        };
+    }
 
-    for (stream_id, mut packet, timebase, is_video_stream) in buffered_packets {
+    for BufferedPacket {
+        stream_id,
+        mut packet,
+        timebase,
+        is_video_stream,
+    } in buffered_packets
+    {
         let pts_90k = crate::ffmpeg_utils::utils::rescale_ts(
             packet.pts().or(packet.dts()).unwrap_or(0),
             timebase,
@@ -1138,32 +905,55 @@ fn generate_media_segment_ffmpeg(
         }
 
         if transcode_audio_to_aac {
-            write_transcoded_audio_upto(
-                dts_90k,
-                &mut muxer,
-                &mut first_audio_dts,
-                &mut first_packet_dts,
-            )?;
+            write_transcoded_audio_upto!(dts_90k);
         }
 
         muxer.write_packet(&mut packet)?;
     }
 
     if transcode_audio_to_aac {
-        write_transcoded_audio_upto(
-            i64::MAX,
-            &mut muxer,
-            &mut first_audio_dts,
-            &mut first_packet_dts,
-        )?;
+        write_transcoded_audio_upto!(i64::MAX);
     }
 
+    Ok((muxer, first_video_dts, first_audio_dts, first_packet_dts))
+}
+
+fn finalize_segment(
+    segment_type: &str,
+    is_interleaved: bool,
+    transcode_audio_to_aac: bool,
+    video_timebase: ffmpeg::Rational,
+    segment: &SegmentInfo,
+    index: &StreamIndex,
+    audio_track_index: Option<usize>,
+    mut muxer: Fmp4Muxer,
+) -> Result<Bytes> {
     let full_data = muxer.finalize()?;
 
-    let media_offset = find_media_segment_offset(&full_data).ok_or_else(|| {
-        HlsError::Muxing("No media segment data found (moof/styp missing)".to_string())
-    })?;
+    let media_offset =
+        crate::segment::muxer::find_media_segment_offset(&full_data).ok_or_else(|| {
+            HlsError::Muxing("No media segment data found (moof/styp missing)".to_string())
+        })?;
     let mut media_data = full_data[media_offset..].to_vec();
+
+    let encoder_delay: i64 = if segment_type == "audio" {
+        if let Some(target) = audio_track_index {
+            index
+                .audio_streams
+                .iter()
+                .find(|a| a.stream_index == target)
+                .map(|a| a.encoder_delay)
+                .unwrap_or(0)
+        } else {
+            index
+                .audio_streams
+                .first()
+                .map(|a| a.encoder_delay)
+                .unwrap_or(0)
+        }
+    } else {
+        0
+    };
 
     let video_target_tfdt = if segment_type == "audio" {
         0
@@ -1192,22 +982,15 @@ fn generate_media_segment_ffmpeg(
     let start_frag_seq = segment.sequence as u32 + 1;
 
     if is_interleaved {
-        // MP4 track IDs are 1-based and follow the ORDER streams were added
-        // to the muxer, NOT the input stream indices. We always add video
-        // first (track_id=1) and audio second (track_id=2).
         let v_track: u32 = 1;
         let a_track: u32 = 2;
 
-        // For interleaved segments, always use per-track tfdt patching
-        // because video and audio tracks have different timescales.
-        // The audio tfdt must be in the audio track's OUTPUT timebase.
         let audio_tfdt_for_patch = if transcode_audio_to_aac {
-            // Transcoded audio: AAC encoder outputs at HLS_SAMPLE_RATE (48kHz)
-            let audio_tb = ffmpeg::Rational::new(1, HLS_SAMPLE_RATE as i32);
+            let audio_tb =
+                ffmpeg::Rational::new(1, crate::transcode::pipeline::HLS_SAMPLE_RATE as i32);
             crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
                 .max(0) as u64
         } else {
-            // Non-transcoded audio: use the source audio's native sample rate
             let a_idx = audio_track_index.unwrap_or(0);
             if let Ok(audio_info) = index.get_audio_stream(a_idx) {
                 let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
@@ -1218,7 +1001,7 @@ fn generate_media_segment_ffmpeg(
             }
         };
 
-        patch_tfdts_per_track(
+        crate::segment::isobmff::patch_tfdts_per_track(
             &mut media_data,
             start_frag_seq,
             v_track,
@@ -1227,30 +1010,156 @@ fn generate_media_segment_ffmpeg(
             audio_tfdt_for_patch,
         );
     } else {
-        patch_tfdts(&mut media_data, video_target_tfdt, start_frag_seq);
+        crate::segment::isobmff::patch_tfdts(&mut media_data, video_target_tfdt, start_frag_seq);
     }
 
-    let _first_display_pts = first_video_dts
-        .or(first_audio_dts)
-        .or(first_packet_dts)
-        .unwrap_or(0);
-
-    // Prepend 'styp' box (Required for HLS fMP4)
-    // Structure: Size (4), Type (4), Major Brand (4), Minor Version (4), Compatible Brands (4...)
-    // Uses "iso8" as major brand, "cmfc" (CMAF) and "iso8" as compatible.
     let styp_box: [u8; 24] = [
-        0x00, 0x00, 0x00, 24, // Size (24 bytes)
-        b's', b't', b'y', b'p', // Type: styp
-        b'i', b's', b'o', b'8', // Major Brand: iso8
-        0x00, 0x00, 0x02, 0x00, // Minor Version: 512
-        b'i', b's', b'o', b'8', // Compatible: iso8
-        b'c', b'm', b'f', b'c', // Compatible: cmfc
+        0x00, 0x00, 0x00, 24, b's', b't', b'y', b'p', b'i', b's', b'o', b'8', 0x00, 0x00, 0x02,
+        0x00, b'i', b's', b'o', b'8', b'c', b'm', b'f', b'c',
     ];
     media_data.splice(0..0, styp_box);
 
     Ok(Bytes::from(media_data))
 }
 
+/// Parse the minimum display PTS across all samples in a muxed fMP4 segment.
+/// Scans every moof/traf/tfdt/trun box and returns the smallest (tfdt + sample_CT) value.
+/// This is the earliest frame display time, used to align audio tfdt.
+fn generate_media_segment_ffmpeg(
+    segment: &SegmentInfo,
+    segment_type: &str,
+    video_track_index: Option<usize>,
+    audio_track_index: Option<usize>,
+    index: &StreamIndex,
+    transcode_audio_to_aac: bool,
+) -> Result<Bytes> {
+    let is_interleaved = segment_type == "av";
+    let video_timebase = index.video_timebase;
+
+    let target_start_sec = segment.start_pts as f64 * video_timebase.numerator() as f64
+        / video_timebase.denominator() as f64;
+    let seek_sec = if is_interleaved && transcode_audio_to_aac {
+        (target_start_sec - 0.5).max(0.0)
+    } else {
+        target_start_sec
+    };
+    let seek_ts = (seek_sec * 1_000_000.0) as i64;
+
+    let mut input = index.get_context()?;
+    input
+        .seek(seek_ts, ..seek_ts)
+        .map_err(|e| HlsError::Ffmpeg(crate::error::FfmpegError::ReadFrame(e.to_string())))?;
+
+    let mut muxer = Fmp4Muxer::new()?;
+    let mut stream_indices = Vec::new();
+
+    for stream in input.streams() {
+        let params = stream.parameters();
+        let codec_id = params.id();
+        let idx = stream.index();
+
+        if is_interleaved {
+            if let Some(video_idx) = video_track_index {
+                if idx == video_idx && crate::ffmpeg_utils::utils::is_video_codec(codec_id) {
+                    muxer.add_video_stream(&params, idx)?;
+                    stream_indices.push(idx);
+                }
+            }
+            if let Some(audio_idx) = audio_track_index {
+                if idx == audio_idx && crate::ffmpeg_utils::utils::is_audio_codec(codec_id) {
+                    let audio_info = index.get_audio_stream(audio_idx)?;
+                    if transcode_audio_to_aac {
+                        let bitrate =
+                            crate::transcode::encoder::get_recommended_bitrate(audio_info.channels);
+                        let encoder = crate::transcode::encoder::AacEncoder::open(
+                            crate::transcode::pipeline::HLS_SAMPLE_RATE,
+                            2,
+                            bitrate,
+                        )?;
+                        muxer.add_audio_stream(&encoder.codec_parameters(), idx)?;
+                    } else {
+                        muxer.add_audio_stream(&params, idx)?;
+                    }
+                    stream_indices.push(idx);
+                }
+            }
+        } else {
+            let is_video =
+                segment_type == "video" && crate::ffmpeg_utils::utils::is_video_codec(codec_id);
+            let is_audio =
+                segment_type == "audio" && crate::ffmpeg_utils::utils::is_audio_codec(codec_id);
+
+            if is_video || is_audio {
+                if let Some(target) = video_track_index.or(audio_track_index) {
+                    if idx != target {
+                        continue;
+                    }
+                }
+                if is_video {
+                    muxer.add_video_stream(&params, idx)?;
+                } else {
+                    muxer.add_audio_stream(&params, idx)?;
+                }
+                stream_indices.push(idx);
+                break;
+            }
+        }
+    }
+
+    if stream_indices.is_empty() {
+        return Err(HlsError::StreamNotFound(format!(
+            "No {} stream found",
+            segment_type
+        )));
+    }
+
+    muxer.write_header(segment_type == "av" || segment_type == "audio")?;
+
+    let buffered_packets = buffer_media_packets(
+        &mut input,
+        segment,
+        segment_type,
+        video_timebase,
+        &stream_indices,
+        audio_track_index,
+    );
+
+    let (transcoded_audio_packets, audio_output_tb) = transcode_audio_if_needed(
+        &mut input,
+        index,
+        audio_track_index,
+        transcode_audio_to_aac,
+        &buffered_packets,
+        segment,
+        video_timebase,
+    )?;
+
+    std::mem::drop(input);
+
+    let (muxer, _v_dts, _a_dts, _p_dts) = mux_media_segment(
+        segment_type,
+        is_interleaved,
+        transcode_audio_to_aac,
+        video_timebase,
+        segment,
+        muxer,
+        buffered_packets,
+        audio_track_index,
+        transcoded_audio_packets,
+        audio_output_tb,
+    )?;
+
+    finalize_segment(
+        segment_type,
+        is_interleaved,
+        transcode_audio_to_aac,
+        video_timebase,
+        segment,
+        index,
+        audio_track_index,
+        muxer,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
