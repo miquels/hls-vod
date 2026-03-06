@@ -939,6 +939,7 @@ fn finalize_segment(
     index: &StreamIndex,
     audio_track_index: Option<usize>,
     mut muxer: Fmp4Muxer,
+    first_video_dts: Option<i64>,
     first_audio_dts: Option<i64>,
     first_packet_dts: Option<i64>,
 ) -> Result<Bytes> {
@@ -1014,12 +1015,20 @@ fn finalize_segment(
             }
         };
 
+        let video_tfdt_for_patch = if let Some(dts) = first_video_dts {
+            dts.max(0) as u64
+        } else if let Some(dts) = first_packet_dts {
+            dts.max(0) as u64
+        } else {
+            video_target_tfdt
+        };
+
         crate::segment::isobmff::patch_tfdts_per_track(
             &mut media_data,
             start_frag_seq,
             v_track,
             a_track,
-            video_target_tfdt,
+            video_tfdt_for_patch,
             audio_tfdt_for_patch,
         );
     } else {
@@ -1195,6 +1204,7 @@ fn generate_media_segment_ffmpeg(
         index,
         audio_track_index,
         muxer,
+        _v_dts,
         _a_dts,
         _p_dts,
     )
