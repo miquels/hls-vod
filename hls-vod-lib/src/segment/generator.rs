@@ -700,14 +700,9 @@ fn buffer_media_packets(
             stream.time_base(),
             ffmpeg::Rational(1, 90000),
         );
-        let dts_90k = crate::ffmpeg_utils::utils::rescale_ts(
-            packet.dts().or(packet.pts()).unwrap_or(0),
-            stream.time_base(),
-            ffmpeg::Rational(1, 90000),
-        );
 
         if is_video_stream {
-            if packet.is_key() && dts_90k >= end_pts_90k {
+            if packet.is_key() && pts_90k >= end_pts_90k {
                 video_done = true;
             }
             if video_done {
@@ -874,7 +869,7 @@ fn mux_media_segment(
         }
 
         if segment_type == "video" || (is_interleaved && is_video_stream) {
-            if dts_90k < start_pts_90k {
+            if pts_90k < start_pts_90k {
                 continue;
             }
         } else {
@@ -938,7 +933,7 @@ fn mux_media_segment(
 fn finalize_segment(
     segment_type: &str,
     is_interleaved: bool,
-    transcode_audio_to_aac: bool,
+    _transcode_audio_to_aac: bool,
     video_timebase: ffmpeg::Rational,
     segment: &SegmentInfo,
     index: &StreamIndex,
@@ -1004,27 +999,18 @@ fn finalize_segment(
         let v_track: u32 = 1;
         let a_track: u32 = 2;
 
-        let audio_tfdt_for_patch = if transcode_audio_to_aac {
-            let audio_tb =
-                ffmpeg::Rational::new(1, crate::transcode::pipeline::HLS_SAMPLE_RATE as i32);
-            crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
-                .max(0) as u64
+        let audio_tfdt_for_patch = if let Some(dts) = first_audio_dts {
+            dts.max(0) as u64
+        } else if let Some(dts) = first_packet_dts {
+            dts.max(0) as u64
         } else {
-            if let Some(dts) = first_audio_dts {
-                dts as u64
-            } else {
-                let a_idx = audio_track_index.unwrap_or(0);
-                if let Ok(audio_info) = index.get_audio_stream(a_idx) {
-                    let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
-                    crate::ffmpeg_utils::utils::rescale_ts(
-                        segment.start_pts,
-                        video_timebase,
-                        audio_tb,
-                    )
+            let a_idx = audio_track_index.unwrap_or(0);
+            if let Ok(audio_info) = index.get_audio_stream(a_idx) {
+                let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
+                crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
                     .max(0) as u64
-                } else {
-                    audio_target_tfdt
-                }
+            } else {
+                audio_target_tfdt
             }
         };
 
@@ -1038,22 +1024,27 @@ fn finalize_segment(
         );
     } else {
         let single_track_tfdt = if segment_type == "video" {
-            video_target_tfdt
-        } else {
-            let a_idx = audio_track_index.unwrap_or(0);
-            if transcode_audio_to_aac {
-                let audio_tb =
-                    ffmpeg::Rational::new(1, crate::transcode::pipeline::HLS_SAMPLE_RATE as i32);
-                crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
-                    .max(0) as u64
-            } else if let Ok(audio_info) = index.get_audio_stream(a_idx) {
-                let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
-                crate::ffmpeg_utils::utils::rescale_ts(segment.start_pts, video_timebase, audio_tb)
-                    .max(0) as u64
-            } else if let Some(dts) = first_packet_dts {
-                dts as u64
+            if let Some(dts) = first_packet_dts {
+                dts.max(0) as u64
             } else {
-                0
+                video_target_tfdt
+            }
+        } else {
+            if let Some(dts) = first_packet_dts {
+                dts.max(0) as u64
+            } else {
+                let a_idx = audio_track_index.unwrap_or(0);
+                if let Ok(audio_info) = index.get_audio_stream(a_idx) {
+                    let audio_tb = ffmpeg::Rational::new(1, audio_info.sample_rate as i32);
+                    crate::ffmpeg_utils::utils::rescale_ts(
+                        segment.start_pts,
+                        video_timebase,
+                        audio_tb,
+                    )
+                    .max(0) as u64
+                } else {
+                    0
+                }
             }
         };
         crate::segment::isobmff::patch_tfdts(&mut media_data, single_track_tfdt, start_frag_seq);

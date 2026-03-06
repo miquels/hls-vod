@@ -30,6 +30,10 @@ fn test_dump_segments() {
     std::fs::write("/tmp/vid0.mp4", &video_bytes).unwrap();
     println!("Wrote video segment 0: {} bytes", video_bytes.len());
 
+    let video_bytes1 = generate_video_segment(&media, 0, 1, &asset).unwrap();
+    std::fs::write("/tmp/vid1.mp4", &video_bytes1).unwrap();
+    println!("Wrote video segment 1: {} bytes", video_bytes1.len());
+
     // === AUDIO ONLY (AAC) ===
     let audio_init_aac = generate_audio_init_segment(&media, 1, None).unwrap();
     std::fs::write("/tmp/aud_init_aac.mp4", &audio_init_aac).unwrap();

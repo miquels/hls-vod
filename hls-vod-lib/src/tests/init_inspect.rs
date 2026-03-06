@@ -4,11 +4,16 @@ use std::io::Read;
 #[test]
 fn inspect_source_boxes_video_alex() {
     let video_path = "/Users/mikevs/Devel/hls-server/video-alex.mp4";
-    let mut file = File::open(video_path).expect("Failed to open file");
+    let Ok(mut file) = File::open(video_path) else {
+        println!("Skipping debug test - video-alex.mp4 not found");
+        return;
+    };
 
     // Read first 15MB which contains the moov
     let mut buffer = vec![0u8; 15_000_000];
-    file.read_exact(&mut buffer).expect("Failed to read file");
+    if file.read_exact(&mut buffer).is_err() {
+        return;
+    }
 
     println!("--- Source File Boxes (first 15MB) ---");
     for box_name in &[b"mvhd", b"tkhd", b"mdhd", b"hdlr", b"elst", b"edts"] {
