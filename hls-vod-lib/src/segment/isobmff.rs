@@ -36,9 +36,32 @@ where
 pub fn fix_trex_durations(data: &mut Vec<u8>, duration: u32) {
     walk_boxes_mut(data, &[b"moov", b"mvex"], &mut |btype, payload| {
         if btype == b"trex" && payload.len() >= 16 {
-            // Set default_sample_duration (offset 16 from start of payload, which is pos + 24 from start of box)
-            // Wait, in the original code, it was offset 20 from pos. payload starts at pos + 8. So it's offset 12 in payload.
+            // trex payload layout: version+flags(4), track_id(4),
+            // default_sample_description_index(4), default_sample_duration(4), ...
             payload[12..16].copy_from_slice(&duration.to_be_bytes());
+        }
+    });
+}
+
+/// Fix default_sample_duration in trex boxes with per-track durations.
+/// Used for interleaved init segments where video and audio need different values
+/// (video: frame duration in 90kHz ticks; audio: codec frame size in sample-rate units).
+pub fn fix_trex_durations_per_track(
+    data: &mut Vec<u8>,
+    video_track_id: u32,
+    video_dur: u32,
+    audio_track_id: u32,
+    audio_dur: u32,
+) {
+    walk_boxes_mut(data, &[b"moov", b"mvex"], &mut |btype, payload| {
+        if btype == b"trex" && payload.len() >= 16 {
+            // payload[4..8] = track_id, payload[12..16] = default_sample_duration
+            let track_id = u32::from_be_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+            if track_id == video_track_id {
+                payload[12..16].copy_from_slice(&video_dur.to_be_bytes());
+            } else if track_id == audio_track_id {
+                payload[12..16].copy_from_slice(&audio_dur.to_be_bytes());
+            }
         }
     });
 }

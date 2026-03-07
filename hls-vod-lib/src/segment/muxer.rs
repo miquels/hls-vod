@@ -118,11 +118,12 @@ impl Fmp4Muxer {
         // self.output.flush(); // Context doesn't always have flush, avio does.
         // But headers are written immediately usually.
 
-        // Return current buffer content (which is the init segment)
-        let data = self.writer.data();
-        self.writer.clear(); // Clear so subsequent writes are just the segments
-
-        Ok(data)
+        // Return current buffer content (which is the init segment).
+        // Do NOT clear the writer: AVIO's internal position counter must stay in sync
+        // with writer.position. If we clear here, FFmpeg's seeks to patch moof size
+        // fields land at wrong offsets (init_size bytes past the actual target),
+        // producing size=0 moof boxes that Chrome's MSE rejects.
+        Ok(self.writer.data())
     }
 
     /// Generate an init segment by writing multiple packets to force `moov` creation.

@@ -207,19 +207,34 @@ impl<'a> InitSegmentBuilder<'a> {
         };
 
         // Pass 4: Fix TREX durations
-        let mut default_duration = 1024; // Safe fallback for audio/mixed
-        if has_video {
-            default_duration = 3000; // 30fps fallback
+        let video_frame_dur = if has_video {
+            let mut d = 3000u32; // 30fps fallback
             if let Some(video_info) = self.index.video_streams.first() {
                 let fps = video_info.framerate;
                 if fps.numerator() > 0 {
-                    default_duration =
-                        (90000 * fps.denominator() as u64 / fps.numerator() as u64) as u32;
+                    d = (90000 * fps.denominator() as u64 / fps.numerator() as u64) as u32;
                 }
             }
-        }
+            d
+        } else {
+            0
+        };
 
-        crate::segment::isobmff::fix_trex_durations(&mut data, default_duration);
+        if has_video && has_audio {
+            // Interleaved: video trex gets frame duration in 90kHz ticks; audio trex gets
+            // the standard AAC frame size (1024 samples) in its own sample-rate timescale.
+            // Track IDs follow the order streams were added: video=1, audio=2.
+            crate::segment::isobmff::fix_trex_durations_per_track(
+                &mut data,
+                1,
+                video_frame_dur,
+                2,
+                1024,
+            );
+        } else {
+            let default_duration = if has_video { video_frame_dur } else { 1024 };
+            crate::segment::isobmff::fix_trex_durations(&mut data, default_duration);
+        }
         Ok(Bytes::from(data))
     }
 }
@@ -785,7 +800,7 @@ fn transcode_audio_if_needed(
 }
 
 fn mux_media_segment(
-    segment_type: &str,
+    _segment_type: &str,
     is_interleaved: bool,
     transcode_audio_to_aac: bool,
     video_timebase: ffmpeg::Rational,
@@ -802,6 +817,14 @@ fn mux_media_segment(
         ffmpeg::Rational(1, 90000),
     );
 
+    // Use the segment's nominal start DTS (in 90kHz ticks) as the audio filter
+    // threshold. segment.start_pts stores the IDR's DTS (from AVIndexEntry), which
+    // is slightly before the IDR's display PTS. Using DTS as the cutoff lets the
+    // audio that sits between IDR_DTS and IDR_PTS pass into this segment, which
+    // preserves continuity with the previous segment's audio (which ended at ~IDR_DTS).
+    // Using IDR_PTS instead would drop ~one-CTO worth of audio (~83ms for 24fps
+    // B-frame content), creating an audible gap at every segment boundary.
+    let audio_start_pts_90k: i64 = start_pts_90k;
     let mut first_packet_dts: Option<i64> = None;
     let mut first_video_dts: Option<i64> = None;
     let mut first_audio_dts: Option<i64> = None;
@@ -868,14 +891,13 @@ fn mux_media_segment(
             continue;
         }
 
-        if segment_type == "video" || (is_interleaved && is_video_stream) {
-            if pts_90k < start_pts_90k {
-                continue;
-            }
+        let stream_threshold = if is_interleaved && !is_video_stream {
+            audio_start_pts_90k
         } else {
-            if pts_90k < start_pts_90k {
-                continue;
-            }
+            start_pts_90k
+        };
+        if pts_90k < stream_threshold {
+            continue;
         }
 
         if let Some(out_tb) = muxer.get_output_timebase(stream_id) {
@@ -912,7 +934,7 @@ fn mux_media_segment(
             }
         }
 
-        if pts_90k < start_pts_90k {
+        if pts_90k < stream_threshold {
             continue;
         }
 
@@ -1092,8 +1114,17 @@ fn generate_media_segment_ffmpeg(
     let seek_ts = (seek_sec * 1_000_000.0) as i64;
 
     let mut input = index.get_context()?;
+    // avformat_seek_file (mov demuxer) compares the target `ts` against PTS, not
+    // DTS. For B-frame video the target IDR has PTS > DTS by one CTO (~83ms for
+    // typical 24-30fps content with a 2-frame reorder window). seek_ts is derived
+    // from segment.start_pts which stores the IDR's DTS (AVIndexEntry.timestamp).
+    // With ts = seek_ts = DTS and backward seek semantics, the mov demuxer finds
+    // the last keyframe whose PTS < ts, which excludes the target IDR (PTS > DTS)
+    // and lands on the PREVIOUS keyframe instead. Adding 500ms to ts ensures
+    // PTS(target IDR) <= ts while still being well below the next segment's IDR.
+    let seek_ts_with_slack = seek_ts + 500_000; // +500ms to clear B-frame CTO
     input
-        .seek(seek_ts, ..seek_ts)
+        .seek(seek_ts_with_slack, ..(seek_ts + 2_000_000))
         .map_err(|e| HlsError::Ffmpeg(crate::error::FfmpegError::ReadFrame(e.to_string())))?;
 
     let mut muxer = Fmp4Muxer::new()?;
@@ -1159,7 +1190,16 @@ fn generate_media_segment_ffmpeg(
         )));
     }
 
-    muxer.write_header(segment_type == "av" || segment_type == "audio")?;
+    // delay_moov is required when there are no video keyframes to trigger
+    // frag_keyframe (pure audio segments), or when we transcode audio and need
+    // FFmpeg to normalise timestamps before writing moov (interleaved + transcode).
+    // For non-transcoded interleaved segments, use frag_keyframe instead: the
+    // video keyframe acts as a natural fragment boundary and timestamps flow
+    // through unchanged, avoiding the CTTS/tfdt corruption that delay_moov
+    // causes for B-frame sources.
+    let needs_delay_moov =
+        segment_type == "audio" || (segment_type == "av" && transcode_audio_to_aac);
+    muxer.write_header(needs_delay_moov)?;
 
     let buffered_packets = buffer_media_packets(
         &mut input,
