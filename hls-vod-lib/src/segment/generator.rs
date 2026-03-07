@@ -1197,8 +1197,20 @@ fn generate_media_segment_ffmpeg(
     // video keyframe acts as a natural fragment boundary and timestamps flow
     // through unchanged, avoiding the CTTS/tfdt corruption that delay_moov
     // causes for B-frame sources.
-    let needs_delay_moov =
-        segment_type == "audio" || (segment_type == "av" && transcode_audio_to_aac);
+    // AAC is the only audio codec the mov muxer can write into moov without
+    // seeing packets first. Every other codec (AC-3, E-AC-3, MP3, Opus, FLAC,
+    // TrueHD, …) either requires bitstream-derived extradata or has a variable
+    // frame size that FFmpeg can only determine from actual packets. When
+    // transcoding to AAC we emit AAC parameters upfront, so no delay needed.
+    // Use delay_moov for any non-AAC audio pass-through.
+    let audio_needs_delay_moov = !transcode_audio_to_aac
+        && audio_track_index
+            .and_then(|idx| index.get_audio_stream(idx).ok())
+            .map(|a| a.codec_id != ffmpeg::codec::Id::AAC)
+            .unwrap_or(false);
+    let needs_delay_moov = segment_type == "audio"
+        || (segment_type == "av" && transcode_audio_to_aac)
+        || (segment_type == "av" && audio_needs_delay_moov);
     muxer.write_header(needs_delay_moov)?;
 
     let buffered_packets = buffer_media_packets(
