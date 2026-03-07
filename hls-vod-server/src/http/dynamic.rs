@@ -78,12 +78,6 @@ pub async fn handle_dynamic_request(
             .map_err(|e| HttpError::InternalError(format!("Failed to open media: {}", e)))?;
 
         if let HlsVideo::MainPlaylist(p) = &mut hls_video {
-            let codecs: Vec<String> = query_params
-                .get("codecs")
-                .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
-                .unwrap_or_default();
-            p.filter_codecs(&codecs);
-
             let tracks: Vec<usize> = query_params
                 .get("tracks")
                 .map(|s| {
@@ -95,6 +89,12 @@ pub async fn handle_dynamic_request(
             if !tracks.is_empty() {
                 p.enable_tracks(&tracks);
             }
+
+            let codecs: Vec<String> = query_params
+                .get("codecs")
+                .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
+                .unwrap_or_default();
+            p.filter_codecs(&codecs);
 
             if query_params
                 .get("interleave")

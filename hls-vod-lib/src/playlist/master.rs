@@ -81,8 +81,16 @@ pub fn generate_master_playlist(
             .filter_map(|c| codec_id(c))
             .any(|id| id == ffmpeg::codec::Id::AAC);
         if has_aac {
-            for s in &orig_index.audio_streams {
-                if s.codec_id == orig_index.audio_streams[0].codec_id {
+            let mut src_codec = None;
+            for s in orig_index
+                .audio_streams
+                .iter()
+                .filter(|a| tracks_enabled.contains(&a.stream_index))
+            {
+                if src_codec.is_none() {
+                    src_codec = Some(s.codec_id);
+                }
+                if Some(s.codec_id) == src_codec {
                     let mut s = s.clone();
                     s.transcode_to = Some(ffmpeg::codec::Id::AAC);
                     index.audio_streams.push(s);
