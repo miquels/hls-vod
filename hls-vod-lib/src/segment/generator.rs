@@ -798,7 +798,7 @@ fn mux_media_segment(
             ffmpeg::Rational(1, 90000),
         );
 
-        if is_interleaved && transcode_audio_to_aac && audio_track_index == Some(stream_id) {
+        if transcode_audio_to_aac && audio_track_index == Some(stream_id) {
             continue;
         }
 
@@ -1132,7 +1132,14 @@ fn generate_media_segment_ffmpeg(
                 if is_video {
                     muxer.add_video_stream(&params, idx)?;
                 } else {
-                    muxer.add_audio_stream(&params, idx)?;
+                    if transcode_audio_to_aac {
+                        let audio_info = index.get_audio_stream(idx)?;
+                        let bitrate = get_recommended_bitrate(audio_info.channels);
+                        let encoder = AacEncoder::open(HLS_SAMPLE_RATE, 2, bitrate)?;
+                        muxer.add_audio_stream(&encoder.codec_parameters(), idx)?;
+                    } else {
+                        muxer.add_audio_stream(&params, idx)?;
+                    }
                 }
                 stream_indices.push(idx);
                 break;
@@ -1515,5 +1522,53 @@ mod tests {
             pos += size;
         }
         assert!(found_mdhd, "mdhd box not found in audio init segment");
+    }
+
+    #[test]
+    fn test_generate_audio_segment_transcode() {
+        let _ = ffmpeg::init();
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let source_path = std::path::PathBuf::from(manifest_dir)
+            .join("tests")
+            .join("assets")
+            .join("video.mp4");
+
+        if !source_path.exists() {
+            return;
+        }
+
+        let mut index = StreamIndex::new(source_path.clone());
+        index.audio_streams.push(crate::media::AudioStreamInfo {
+            stream_index: 1,
+            codec_id: ffmpeg::codec::Id::AC3, // Mock as AC3 to trigger transcode logic
+            sample_rate: 48000,
+            channels: 2,
+            bitrate: 128000,
+            language: Some("en".to_string()),
+            transcode_to: Some(ffmpeg::codec::Id::AAC),
+            encoder_delay: 0,
+        });
+
+        let segment = crate::media::SegmentInfo {
+            sequence: 0,
+            start_pts: 0,
+            end_pts: 360000,
+            duration_secs: 4.0,
+            is_keyframe: true,
+            video_byte_offset: 0,
+        };
+        index.segments.push(segment);
+
+        let result = generate_audio_segment(&index, 1, 0, &source_path, Some("aac"));
+
+        match result {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                assert!(bytes.windows(4).any(|w| w == b"styp"));
+                assert!(bytes.windows(4).any(|w| w == b"moof"));
+                assert!(bytes.windows(4).any(|w| w == b"mdat"));
+            }
+            Err(e) => panic!("Failed to transcode audio segment: {:?}", e),
+        }
     }
 }
