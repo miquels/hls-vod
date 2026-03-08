@@ -8,14 +8,11 @@ license = "MIT"
 [dependencies]
 hls-vod-lib = { path = "../hls-vod-lib" }
 
-# FFmpeg bindings - use latest version compatible with system FFmpeg 8.0
-ffmpeg-next = "8.0"
-
 # Async runtime and HTTP server
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 axum = { version = "0.8.8", features = ["macros"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Concurrency and caching
 dashmap = "5.5"
@@ -29,15 +26,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 uuid = { version = "1.6", features = ["v4", "fast-rng"] }
 thiserror = "1.0"
-bytes = "1.5"
+bytes = "1.11"
 chrono = "0.4"
-regex = "1.10"
+regex = "1.12"
 
 # Configuration (for Milestone 10)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-mp4 = "0.14.0"
 
 [dev-dependencies]
 reqwest = { version = "0.11", features = ["json"] }
