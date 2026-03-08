@@ -1,16 +1,26 @@
+use std::sync::Arc;
+
 use axum::{
     body::{Body, Bytes},
     extract::State,
     http::{header::HeaderMap, method::Method, uri::Uri, StatusCode},
     response::Response,
 };
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
 
 use crate::AppState;
 
 use crate::types::{
     HlsTranscodingParameters, PlaybackInfoRequest, PlaybackInfoResponse, TranscodingProfile,
 };
+
+// helper.
+macro_rules! regex {
+    ($re:literal $(,)?) => {{
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new($re).unwrap())
+    }};
+}
 
 pub async fn playback_info_handler(
     State(state): State<Arc<AppState>>,
@@ -41,11 +51,6 @@ pub async fn playback_info_handler(
 
     // 2. Mutate request
     mutate_playback_info_request(&mut req_data, user_agent, state.safari_force_transcoding);
-
-    println!(
-        "XXX PlaybackInfo request decoded and mutated: \n{}",
-        serde_json::to_string_pretty(&req_data).unwrap(),
-    );
 
     let modified_body = serde_json::to_vec(&req_data).unwrap();
 
@@ -114,7 +119,7 @@ pub async fn playback_info_handler(
         };
 
         // 4. Mutate response
-        if let Err(e) = mutate_playback_info_response(&mut resp_data) {
+        if let Err(e) = mutate_playback_info_response(&headers, &mut resp_data) {
             return Err(e);
         }
 
@@ -154,6 +159,29 @@ pub async fn playback_info_handler(
         tracing::error!("Response building error in PlaybackInfo fallback: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+// Calculate a unique stream-id from the DeviceId and the item id.
+// This will be unique per device, but not per session, which is what we want.
+fn calculate_stream_id(headers: &HeaderMap, item_id: &str) -> Option<String> {
+    if let Some(device_id) = headers
+        .get(reqwest::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        if let Some(caps) = regex!(r#"DeviceId="([^"]+)"#).captures(device_id) {
+            // Hash device_id and item_id.
+            let mut hasher = Sha256::new();
+            hasher.update(caps[1].as_bytes());
+            hasher.update(item_id.as_bytes());
+            let hash = hasher.finalize();
+
+            // Take 128 bytes and print it as hex.
+            let mut num = [0u8; 16];
+            num.copy_from_slice(&hash[..16]);
+            return Some(format!("{:032x}", u128::from_be_bytes(num)));
+        }
+    }
+    None
 }
 
 fn profile_is(profile: &TranscodingProfile, container: &str) -> bool {
@@ -198,7 +226,6 @@ fn mutate_playback_info_request(
     if is_safari && safari_force_transcoding {
         device_profile.direct_play_profiles = Vec::new();
     }
-    println!("XXX device_profile: {:#?}", device_profile);
 }
 
 // Rewrite a .m3u8 hls url pointing to the jellyfin transmuxing/transcoding
@@ -206,6 +233,7 @@ fn mutate_playback_info_request(
 fn rewrite_hls_url(
     orig_url: &str,
     transcode_url: &str,
+    stream_id: &Option<String>,
     transcode: bool,
 ) -> Result<String, StatusCode> {
     // Some Jellyfin URLs might be relative. We'll prepend a dummy base so we can parse them.
@@ -255,7 +283,7 @@ fn rewrite_hls_url(
     }
 
     // Session id.
-    if let Some(session_id) = &params.play_session_id {
+    if let Some(session_id) = stream_id {
         proxy_query.push(format!("stream_id={}", urlencoding::encode(session_id)));
     }
 
@@ -277,7 +305,21 @@ fn rewrite_hls_url(
 }
 
 // Rewrite the PlaybackinfoResponse.
-fn mutate_playback_info_response(resp: &mut PlaybackInfoResponse) -> Result<(), StatusCode> {
+fn mutate_playback_info_response(
+    headers: &HeaderMap,
+    resp: &mut PlaybackInfoResponse,
+) -> Result<(), StatusCode> {
+    // Calculate a stream id based on the item_id and the device_id,
+    // so that if the client switches tracks, the stream_id remains unchanged.
+    // This is important because we use it as a key for the ffmpeg index data,
+    // preventing the index getting re-read when switching tracks.
+    let stream_id = if !resp.media_sources.is_empty() {
+        calculate_stream_id(headers, &resp.media_sources[0].id)
+    } else {
+        resp.play_session_id.clone()
+    };
+    let mut update_play_session_id = false;
+
     for source in resp.media_sources.iter_mut() {
         let clean_path = source.path.trim_start_matches('/');
         let encoded_path = clean_path
@@ -289,14 +331,15 @@ fn mutate_playback_info_response(resp: &mut PlaybackInfoResponse) -> Result<(), 
 
         // Rewrite TransCodingUrl.
         if let Some(transcoding_url) = &source.transcoding_url {
-            source.transcoding_url =
-                Some(rewrite_hls_url(transcoding_url, &base_transcode_url, true)?);
+            source.transcoding_url = Some(rewrite_hls_url(
+                transcoding_url,
+                &base_transcode_url,
+                &stream_id,
+                true,
+            )?);
             source.transcoding_sub_protocol = Some("hls".to_string());
             source.transcoding_container = Some("mp4".to_string());
-            println!(
-                "XXX PlaybackInfo transcoding_url: {:#?}",
-                source.transcoding_url
-            );
+            update_play_session_id = true;
         }
 
         // DirectStreamUrl is like TranscodingUrl, but without transcoding.
@@ -305,16 +348,16 @@ fn mutate_playback_info_response(resp: &mut PlaybackInfoResponse) -> Result<(), 
                 source.direct_stream_url = Some(rewrite_hls_url(
                     direct_stream_url,
                     &base_transcode_url,
+                    &stream_id,
                     false,
                 )?);
-                println!(
-                    "XXX PlaybackInfo direct_stream_url: {:#?}",
-                    source.direct_stream_url
-                );
             }
+            update_play_session_id = true;
         }
+    }
 
-        // source.supports_direct_play = false;
+    if update_play_session_id && stream_id.is_some() {
+        resp.play_session_id = stream_id;
     }
 
     Ok(())
@@ -397,7 +440,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        mutate_playback_info_response(&mut resp).unwrap();
+        let headers = HeaderMap::new();
+        mutate_playback_info_response(&headers, &mut resp).unwrap();
         let media_source = &resp.media_sources[0];
         // source.supports_direct_play is false by Default
         assert_eq!(media_source.supports_direct_play, false);
@@ -417,7 +461,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        mutate_playback_info_response(&mut resp).unwrap();
+        let headers = HeaderMap::new();
+        mutate_playback_info_response(&headers, &mut resp).unwrap();
         let media_source = &resp.media_sources[0];
         assert_eq!(
             media_source.transcoding_url.as_deref(),
