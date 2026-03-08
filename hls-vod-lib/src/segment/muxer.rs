@@ -293,69 +293,6 @@ impl Drop for Fmp4Muxer {
     }
 }
 
-/// Mux a list of AAC packets into a single fMP4 byte buffer.
-///
-/// Uses `frag_every_frame` so each `av_interleaved_write_frame` call emits a
-/// moof+mdat fragment immediately to the in-memory writer.  This is required
-/// for audio-only segments because the default `empty_moov+frag_keyframe`
-/// setup buffers all packets internally and only flushes on `write_trailer`,
-/// which fails under our custom AVIO context.
-///
-/// Returns the full fMP4 bytes (ftyp + moov init + moof/mdat fragments).
-pub fn mux_aac_packets_to_fmp4(
-    codec_params: &ffmpeg::codec::parameters::Parameters,
-    mut packets: Vec<ffmpeg::Packet>,
-) -> crate::error::Result<Vec<u8>> {
-    use crate::error::FfmpegError;
-
-    ffmpeg::init().map_err(|e| FfmpegError::InitFailed(e.to_string()))?;
-
-    let (mut output, writer) = create_memory_io()?;
-
-    // Add audio stream
-    let mut out_stream = output
-        .add_stream(ffmpeg::encoder::find(ffmpeg::codec::Id::None))
-        .map_err(|e| FfmpegError::StreamConfig(format!("add_stream: {}", e)))?;
-    out_stream.set_parameters(codec_params.clone());
-    let sample_rate = crate::ffmpeg_utils::helpers::codec_params_sample_rate(codec_params) as i32;
-    let sample_rate = sample_rate.max(1);
-    out_stream.set_time_base(ffmpeg::Rational::new(1, sample_rate));
-
-    // Write header. We don't use frag_every_frame anymore because our custom IO
-    // now correctly supports seeking (AVSEEK_SIZE), allowing write_trailer()
-    // to flush the buffer as a single clean fragment.
-    let mut opts = ffmpeg::Dictionary::new();
-    opts.set("movflags", "empty_moov+default_base_moof");
-    output
-        .write_header_with(opts)
-        .map_err(|e| FfmpegError::WriteError(format!("write_header: {}", e)))?;
-
-    // Write each AAC packet
-    for pkt in &mut packets {
-        pkt.set_stream(0);
-        if pkt.duration() == 0 {
-            pkt.set_duration(1024);
-        }
-        pkt.write_interleaved(&mut output)
-            .map_err(|e| FfmpegError::WriteError(format!("write_packet: {}", e)))?;
-    }
-
-    // write_trailer: non-fatal; with frag_every_frame data is already written
-    if let Err(e) = output.write_trailer() {
-        tracing::debug!("mux_aac_packets_to_fmp4: write_trailer (non-fatal): {}", e);
-    }
-
-    let data = writer.data();
-
-    // Drop output BEFORE writer to avoid double-free of the AVIO pb pointer.
-    // The Fmp4Muxer Drop impl sets pb=null; replicate that here.
-    crate::ffmpeg_utils::helpers::detach_avio(&mut output);
-    drop(output);
-    drop(writer);
-
-    Ok(data)
-}
-
 #[allow(dead_code)] // we need this for testing and development
 pub fn validate_fmp4(data: &[u8]) -> bool {
     if data.len() < 8 {
