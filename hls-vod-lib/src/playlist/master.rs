@@ -152,6 +152,7 @@ pub fn generate_master_playlist(
                 .transcode_to
                 .and_then(|c| codec_name_short(c))
                 .map(String::from);
+            println!("audio_transcode_to: {:?}", audio_transcode_to);
 
             let uri = crate::params::HlsParams {
                 video_url: video_url.to_string(),
@@ -162,6 +163,8 @@ pub fn generate_master_playlist(
                     audio_transcode_to,
                 }),
             };
+            println!("uri 1: {:?}", uri);
+            println!("uri 2 {}", uri.encode_url());
 
             output.push_str(&format!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",LANGUAGE=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT=YES,URI=\"{}\"\n",
@@ -263,8 +266,7 @@ pub fn generate_master_playlist(
             }
             let codecs = codec_list.join(",");
 
-            let bandwidth =
-                calculate_bandwidth(video.bitrate.max(100_000), &[audio.bitrate as u32]);
+            let bandwidth = calculate_bandwidth(video.bitrate.max(100_000), audio.bitrate as u32);
 
             let subtitle_attr = if has_subs {
                 ",SUBTITLES=\"subs\"".to_string()
@@ -304,7 +306,7 @@ pub fn generate_master_playlist(
                 &[],
                 !index.subtitle_streams.is_empty(),
             );
-            let bandwidth = calculate_bandwidth(video.bitrate.max(100000), &[]);
+            let bandwidth = calculate_bandwidth(video.bitrate.max(100000), 0);
             let codec_attr = codecs
                 .map(|c| format!(",CODECS=\"{}\"", c))
                 .unwrap_or_default();
@@ -353,15 +355,16 @@ pub fn generate_master_playlist(
                 }
                 let codecs = codec_list.join(",");
 
-                // Bandwidth: video + all audio streams in this group
-                let group_audio_bitrates: Vec<u32> = index
+                // Bandwidth: video + highest bitrate audio stream in this group
+                let audio_bitrate: u32 = index
                     .audio_streams
                     .iter()
                     .filter(|s| group_id_for_stream(s) == *group_id)
                     .map(|s| s.bitrate as u32)
-                    .collect();
-                let bandwidth =
-                    calculate_bandwidth(video.bitrate.max(100_000), &group_audio_bitrates);
+                    .max()
+                    .unwrap_or(0);
+
+                let bandwidth = calculate_bandwidth(video.bitrate.max(100_000), audio_bitrate);
 
                 let uri = crate::params::HlsParams {
                     video_url: video_url.to_string(),

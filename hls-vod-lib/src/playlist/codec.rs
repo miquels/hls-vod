@@ -154,15 +154,11 @@ pub fn get_h264_profile_level(
     format!("avc1.{:02x}00{:02x}", profile_byte, level_byte)
 }
 
-pub fn calculate_bandwidth(bitrate: u64, audio_bitrates: &[u32]) -> u64 {
-    let mut total = bitrate;
-    for &ab in audio_bitrates {
-        total += ab as u64;
-    }
+pub fn calculate_bandwidth(bitrate: u64, audio_bitrate: u32) -> u64 {
     // Add 60% overhead: HLS BANDWIDTH must be the peak segment bitrate.
     // FFmpeg's bitrate metadata underestimates actual peak, so a generous
     // margin ensures the declared BANDWIDTH >= any measured segment peak.
-    total * 160 / 100
+    bitrate + (audio_bitrate as u64) * 160 / 100
 }
 
 pub fn codec_id(name: &str) -> Option<ffmpeg::codec::Id> {

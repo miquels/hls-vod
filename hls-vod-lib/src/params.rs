@@ -333,9 +333,9 @@ impl fmt::Display for Playlist {
         write!(f, "t.{}", self.track_id)?;
         if let Some(audio_track_id) = self.audio_track_id {
             write!(f, "+{}", audio_track_id)?;
-            if let Some(audio_transcode_to) = &self.audio_transcode_to {
-                write!(f, "-{}", audio_transcode_to)?;
-            }
+        }
+        if let Some(audio_transcode_to) = &self.audio_transcode_to {
+            write!(f, "-{}", audio_transcode_to)?;
         }
         write!(f, ".m3u8")
     }
